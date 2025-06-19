@@ -1,0 +1,50 @@
+[project]
+name = "collateral_sdk"
+version = "0.1.0"
+description = ""
+authors = []
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.coverage.report]
+exclude_also = [
+  "@(abc\\.)?abstractmethod",
+  "class \\.+\\(.*\\b(abc\\.)?ABC\\b.*\\):",
+  "class \\.+\\(.*\\b(typing\\.)?Protocol\\b.*\\):",
+  "class \\.+\\(.*\\bmetaclass=(abc\\.)?ABCMeta\\b.*\\):",
+  "def __repr__\\(self\\)( -> str)?:",
+  "def __str__\\(self\\)( -> str)?:",
+  "if __debug__:",
+  "if __name__ == [\"']__main__[\"']:",
+  "if DEBUG:",
+  "if TYPE_CHECKING:",
+  "raise AssertionError",
+  "raise NotImplementedError",
+]
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.poetry.dependencies]
+bittensor = "^9.6.0"
+bittensor-cli = "^9.4.4"
+python = ">=3.10,<3.11"
+web3 = "^7.12.0"
+
+[tool.poetry.group.dev.dependencies]
+ipykernel = "^6.29.5"
+isort = "^6.0.1"
+pre-commit = "^4.2.0"
+pytest = "^8.3.5"
+pytest-cov = "^6.1.1"
+ruff = "^0.11.9"
+
+[tool.pyright]
+typeCheckingMode = "standard"
+
+[tool.ruff]
+line-length = 120
