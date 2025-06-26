@@ -12,12 +12,12 @@ from bittensor.core.subtensor_api import SubtensorApi
 from bittensor.utils import is_valid_ss58_address
 from bittensor.utils.balance import Balance
 from bittensor_wallet import Wallet
-from scalecodec.types import GenericCall, GenericExtrinsic
+from scalecodec.types import GenericCall, GenericExtrinsic, ScaleBytes
 from web3 import Web3
 
 from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
-from .utils import pubkey_to_h160, ss58_to_h160
+from .utils import ss58_to_h160
 
 
 class Network(Enum):
@@ -208,8 +208,14 @@ class CollateralManager:
             GenericExtrinsic: The decoded extrinsic.
         """
 
-        # TODO
-        raise NotImplementedError
+        extrinsic = GenericExtrinsic(
+            data=ScaleBytes(data),
+            metadata=self.subtensor_api.substrate.metadata,
+            runtime_config=self.subtensor_api.substrate.runtime_config,
+        )
+        extrinsic.decode()
+
+        return extrinsic
 
     def encode_extrinsic(self, extrinsic: GenericExtrinsic) -> bytearray:
         """
@@ -227,6 +233,7 @@ class CollateralManager:
     def deposit(
         self,
         extrinsic: GenericExtrinsic,
+        sender: str,
         vault_stake: str,
         vault_wallet: Wallet,
         owner_address: str,
@@ -241,6 +248,7 @@ class CollateralManager:
 
         Args:
             extrinsic (GenericExtrinsic): The signed extrinsic for the stake transfer.
+            sender (str): The SS58 address of the sender of the deposit. This is used to revert the transfer.
             vault_stake (str): The stake's SS58 address of the vault to deposit the alpha tokens to.
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
@@ -256,9 +264,34 @@ class CollateralManager:
             If a critical error occurs, log the error and transfer the stake back to the source address manually!
         """
 
-        if extrinsic["call"]["call_args"]["destination_coldkey"].value != vault_wallet.coldkeypub.ss58_address:
+        if isinstance(call_args := extrinsic["call"]["call_args"], dict):
+            destination_coldkey = call_args["destination_coldkey"].value
+            destination_netuid = call_args["destination_netuid"].value
+            origin_hotkey = call_args["hotkey"].value
+            origin_netuid = call_args["origin_netuid"].value
+        else:
+            try:
+                call_args = extrinsic.value["call"]["call_args"]  # pyright: ignore[reportOptionalSubscript]
+                destination_coldkey = next(arg for arg in call_args if arg["name"] == "destination_coldkey")["value"]
+                destination_netuid = next(arg for arg in call_args if arg["name"] == "destination_netuid")["value"]
+                origin_hotkey = next(arg for arg in call_args if arg["name"] == "hotkey")["value"]
+                origin_netuid = next(arg for arg in call_args if arg["name"] == "origin_netuid")["value"]
+            except StopAsyncIteration:
+                raise ValueError("Invalid extrinsic: missing required call arguments")
+
+        if destination_coldkey != vault_wallet.coldkeypub.ss58_address:
             raise ValueError(
-                f"The extrinsic's destination {extrinsic['call']['call_params']['destination_coldkey']} does not match the vault wallet {vault_wallet.coldkeypub.ss58_address}"
+                f"The extrinsic's destination {destination_coldkey} does not match the vault wallet {vault_wallet.coldkeypub.ss58_address}"
+            )
+
+        if destination_netuid != self.network.netuid:
+            raise ValueError(
+                f"The extrinsic's destination netuid {destination_netuid} does not match the network's netuid {self.network.netuid}"
+            )
+
+        if origin_netuid != self.network.netuid:
+            raise ValueError(
+                f"The extrinsic's origin netuid {origin_netuid} does not match the network's netuid {self.network.netuid}"
             )
 
         # 1. Transfer the stake to the vault wallet.
@@ -286,12 +319,12 @@ class CollateralManager:
         )[0]["event"]
         stake_added = Balance.from_rao(
             stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy
-            netuid=extrinsic["call"]["call_args"]["destination_netuid"].value,
+            netuid=self.network.netuid,
         )
 
         # 2. Move the stake to the vault's stake address.
         for i in range(max_retries):
-            if extrinsic["call"]["call_args"]["hotkey"].value == vault_stake:
+            if origin_hotkey == vault_stake:
                 break
 
             try:
@@ -299,10 +332,10 @@ class CollateralManager:
                     call_module="SubtensorModule",
                     call_function="move_stake",
                     call_params={
-                        "origin_hotkey": extrinsic["call"]["call_args"]["hotkey"].value,
-                        "origin_netuid": extrinsic["call"]["call_args"]["destination_netuid"].value,
+                        "origin_hotkey": origin_hotkey,
+                        "origin_netuid": self.network.netuid,
                         "destination_hotkey": vault_stake,
-                        "destination_netuid": extrinsic["call"]["call_args"]["destination_netuid"].value,
+                        "destination_netuid": self.network.netuid,
                         "alpha_amount": stake_added.rao,
                     },
                 )
@@ -322,7 +355,7 @@ class CollateralManager:
                 )[0]["event"]
                 stake_added = Balance.from_rao(
                     stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy,
-                    netuid=extrinsic["call"]["call_args"]["destination_netuid"].value,
+                    netuid=self.network.netuid,
                 )
 
                 if result.is_success:
@@ -340,10 +373,10 @@ class CollateralManager:
                         try:
                             success = self.subtensor_api.extrinsics.transfer_stake(
                                 wallet=vault_wallet,
-                                destination_coldkey_ss58=extrinsic["address"].value,
-                                hotkey_ss58=extrinsic["call"]["call_args"]["hotkey"].value,
-                                origin_netuid=extrinsic["call"]["call_args"]["origin_netuid"].value,
-                                destination_netuid=extrinsic["call"]["call_args"]["origin_netuid"].value,
+                                destination_coldkey_ss58=sender,
+                                hotkey_ss58=origin_hotkey,
+                                origin_netuid=self.network.netuid,
+                                destination_netuid=self.network.netuid,
                                 amount=stake_added,
                                 wait_for_inclusion=True,
                             )
@@ -368,9 +401,7 @@ class CollateralManager:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
-                tx = contract.functions.deposit(
-                    pubkey_to_h160(extrinsic["address"].value), stake_added.rao
-                ).build_transaction(
+                tx = contract.functions.deposit(ss58_to_h160(sender), stake_added.rao).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
@@ -394,15 +425,15 @@ class CollateralManager:
                     time.sleep(max(2**i, max_backoff))
                     continue
                 else:
-                    # 3. Revert the stake transfer if the stake move fails.
+                    # 4. Revert the stake transfer if deposit in the EVM fails.
                     for j in range(max_reverts):
                         try:
                             success = self.subtensor_api.extrinsics.transfer_stake(
                                 wallet=vault_wallet,
-                                destination_coldkey_ss58=extrinsic["address"].value,
-                                hotkey_ss58=extrinsic["call"]["call_args"]["hotkey"].value,
-                                origin_netuid=extrinsic["call"]["call_args"]["origin_netuid"].value,
-                                destination_netuid=extrinsic["call"]["call_args"]["origin_netuid"].value,
+                                destination_coldkey_ss58=sender,
+                                hotkey_ss58=vault_stake,
+                                origin_netuid=self.network.netuid,
+                                destination_netuid=self.network.netuid,
                                 amount=stake_added,
                                 wait_for_inclusion=True,
                             )
