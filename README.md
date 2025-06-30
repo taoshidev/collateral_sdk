@@ -46,5 +46,5 @@ And then open one of the notebooks in the `exmaples/`, replace `REPLACE_ME` with
 Add the following to `requirements.txt`.
 
 ```
-git+https://https://github.com/taoshidev/collateral_sdk.git@<VERSION>#egg=collateral_sdk
+git+https://github.com/taoshidev/collateral_sdk.git@<VERSION>#egg=collateral_sdk
 ```
