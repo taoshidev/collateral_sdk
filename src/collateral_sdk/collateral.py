@@ -328,7 +328,7 @@ class CollateralManager:
                 break
 
             try:
-                call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+                move_call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
                     call_module="SubtensorModule",
                     call_function="move_stake",
                     call_params={
@@ -341,21 +341,13 @@ class CollateralManager:
                 )
 
                 move_extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
-                    call=call,
+                    call=move_call,
                     keypair=vault_wallet.coldkey,
                 )
 
                 result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
                     move_extrinsic,
                     wait_for_inclusion=True,
-                )
-
-                stake_added_event: dict = list(
-                    filter(lambda ev: ev["event"]["event_id"] == "StakeAdded", result.triggered_events)
-                )[0]["event"]
-                stake_added = Balance.from_rao(
-                    stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy,
-                    netuid=self.network.netuid,
                 )
 
                 if result.is_success:
@@ -371,29 +363,41 @@ class CollateralManager:
                     # 3. Revert the stake transfer if the stake move fails.
                     for j in range(max_reverts):
                         try:
-                            success = self.subtensor_api.extrinsics.transfer_stake(
-                                wallet=vault_wallet,
-                                destination_coldkey_ss58=sender,
-                                hotkey_ss58=origin_hotkey,
-                                origin_netuid=self.network.netuid,
-                                destination_netuid=self.network.netuid,
-                                amount=stake_added,
+                            revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                                amount=stake_added.rao,
+                                source_stake=origin_hotkey,
+                                source_wallet=vault_wallet,
+                                dest=sender,
+                            )
+
+                            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                                revert_extrinsic,
                                 wait_for_inclusion=True,
                             )
 
-                            if success:
+                            if result.is_success:
                                 break
                             else:
-                                raise RuntimeError("Failed transfer the stake back to the source address.")
+                                raise ChainError.from_error(result.error_message)
 
                         except BaseException as e:
                             if j < max_reverts - 1:
                                 time.sleep(max(2**j, max_backoff))
                                 continue
                             else:
+                                # When the revert fails, raise a critical error.
                                 raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
 
+                    # After reverting the stake transfer, raise an error for the stake move failure.
                     raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
+
+        stake_added_event: dict = list(
+            filter(lambda ev: ev["event"]["event_id"] == "StakeAdded", result.triggered_events)  # pyright: ignore[reportPossiblyUnboundVariable]
+        )[0]["event"]
+        stake_added = Balance.from_rao(
+            stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy,
+            netuid=self.network.netuid,
+        )
 
         # 4. Deposit the collateral into the EVM contract.
         for i in range(max_retries):
@@ -428,28 +432,32 @@ class CollateralManager:
                     # 4. Revert the stake transfer if deposit in the EVM fails.
                     for j in range(max_reverts):
                         try:
-                            success = self.subtensor_api.extrinsics.transfer_stake(
-                                wallet=vault_wallet,
-                                destination_coldkey_ss58=sender,
-                                hotkey_ss58=vault_stake,
-                                origin_netuid=self.network.netuid,
-                                destination_netuid=self.network.netuid,
-                                amount=stake_added,
+                            revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                                amount=stake_added.rao,
+                                source_stake=vault_stake,
+                                source_wallet=vault_wallet,
+                                dest=sender,
+                            )
+
+                            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                                revert_extrinsic,
                                 wait_for_inclusion=True,
                             )
 
-                            if success:
+                            if result.is_success:
                                 break
                             else:
-                                raise RuntimeError("Failed transfer the stake back to the source address.")
+                                raise ChainError.from_error(result.error_message)
 
                         except BaseException as e:
                             if j < max_reverts - 1:
                                 time.sleep(max(2**j, max_backoff))
                                 continue
                             else:
+                                # When the revert fails, raise a critical error.
                                 raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
 
+                    # After reverting the stake transfer, raise an error for the deposit failure.
                     raise EVMError(f"Failed to deposit into the EVM contract: {e}") from e
 
         return stake_added
@@ -751,22 +759,22 @@ class CollateralManager:
         # 2. Transfer the stake to the destination address.
         for i in range(max_retries):
             try:
-                extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                    amount=amount.tao,  # pyright: ignore[reportArgumentType]
+                transfer_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                    amount=amount.rao,
                     source_stake=vault_stake,
                     source_wallet=vault_wallet,
                     dest=dest,
                 )
 
                 result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
-                    extrinsic,
+                    transfer_extrinsic,
                     wait_for_inclusion=True,
                 )
 
                 if result.is_success:
                     break
                 else:
-                    ChainError.from_error(result.error_message)
+                    raise ChainError.from_error(result.error_message)
 
             except BaseException as e:
                 if i < max_retries - 1:
@@ -789,10 +797,12 @@ class CollateralManager:
                                 time.sleep(max(2**j, max_backoff))
                                 continue
                             else:
+                                # When the revert fails, raise a critical error.
                                 raise CriticalError(
                                     f"Failed to revert the withdrawal from the EVM contract: {e}"
                                 ) from e
 
+                    # After reverting the withdrawal, raise an error for the stake transfer failure.
                     raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
 
         return amount
