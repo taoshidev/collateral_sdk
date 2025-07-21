@@ -104,7 +104,13 @@ class CollateralManager:
 
         self.network = network
         self.program_address = program_address or network.evm_program_address
-        self.subtensor_api = SubtensorApi(network=network.subtensor_network)
+        self._subtensor_api = None
+
+    @property
+    def subtensor_api(self):
+        if self._subtensor_api is None:
+            self._subtensor_api = SubtensorApi(network=self.network.subtensor_network)
+        return self._subtensor_api
 
     def balance_of(self, address: str) -> int:
         """
@@ -207,7 +213,6 @@ class CollateralManager:
         Returns:
             GenericExtrinsic: The decoded extrinsic.
         """
-
         extrinsic = GenericExtrinsic(
             data=ScaleBytes(data),
             metadata=self.subtensor_api.substrate.metadata,
@@ -462,7 +467,7 @@ class CollateralManager:
 
         return stake_added
 
-    def force_depoist(
+    def force_deposit(
         self,
         address: str,
         amount: int,
@@ -784,7 +789,7 @@ class CollateralManager:
                     # 3. Revert the withdrawal if the stake transfer fails.
                     for j in range(max_reverts):
                         try:
-                            self.force_depoist(
+                            self.force_deposit(
                                 amount=amount.rao,
                                 address=dest,
                                 owner_address=owner_address,
