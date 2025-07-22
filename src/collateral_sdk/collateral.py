@@ -58,7 +58,8 @@ class Network(Enum):
         elif self.value == Network.MAINNET.value:
             return "UPDATE_ME"  # TODO
         elif self.value == Network.TESTNET.value:
-            return "0xC3060777dDAa3A41F024341a8B7fd6Eaa29A0366"
+            return "0x0E35E8aCA3c18280b62df50415bd64c58635e857"     # testnet-validator1
+            # return "0xC3060777dDAa3A41F024341a8B7fd6Eaa29A0366"
         else:
             raise ValueError(f"Unknown network: {self}")
 
@@ -243,6 +244,7 @@ class CollateralManager:
         vault_wallet: Wallet,
         owner_address: str,
         owner_private_key: str,
+        wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
         max_reverts: int = 3,
@@ -258,6 +260,7 @@ class CollateralManager:
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
+            wallet_password (Optional[str]): The password for the source wallet.
             max_backoff (float): The maximum backoff time in seconds for retries/reverts. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
             max_reverts (int): The maximum number of attempts to revert. Defaults to 3.
@@ -347,7 +350,7 @@ class CollateralManager:
 
                 move_extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
                     call=move_call,
-                    keypair=vault_wallet.coldkey,
+                    keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
                 )
 
                 result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
@@ -373,6 +376,7 @@ class CollateralManager:
                                 source_stake=origin_hotkey,
                                 source_wallet=vault_wallet,
                                 dest=sender,
+                                wallet_password=wallet_password,
                             )
 
                             result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
@@ -442,6 +446,7 @@ class CollateralManager:
                                 source_stake=vault_stake,
                                 source_wallet=vault_wallet,
                                 dest=sender,
+                                wallet_password=wallet_password,
                             )
 
                             result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
@@ -684,6 +689,7 @@ class CollateralManager:
         vault_wallet: Wallet,
         owner_address: str,
         owner_private_key: str,
+        wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
         max_reverts: int = 3,
@@ -699,6 +705,7 @@ class CollateralManager:
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
+            wallet_password (Optional[str]): The password for the source wallet.
             max_backoff (float): The maximum backoff time in seconds for retries/reverts. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
             max_reverts (int): The maximum number of attempts to revert. Defaults to 3.
@@ -769,6 +776,7 @@ class CollateralManager:
                     source_stake=vault_stake,
                     source_wallet=vault_wallet,
                     dest=dest,
+                    wallet_password=wallet_password
                 )
 
                 result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
