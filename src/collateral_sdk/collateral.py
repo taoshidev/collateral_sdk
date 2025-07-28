@@ -271,6 +271,7 @@ class CollateralManager:
             If a critical error occurs, log the error and transfer the stake back to the source address manually!
         """
 
+        origin_coldkey = extrinsic.value["address"]
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
             destination_coldkey = call_args["destination_coldkey"].value
             destination_netuid = call_args["destination_netuid"].value
@@ -374,7 +375,7 @@ class CollateralManager:
                                 amount=stake_added.rao,
                                 source_stake=origin_hotkey,
                                 source_wallet=vault_wallet,
-                                dest=sender,
+                                dest=origin_coldkey,
                                 wallet_password=wallet_password,
                             )
 
@@ -444,7 +445,7 @@ class CollateralManager:
                                 amount=stake_added.rao,
                                 source_stake=vault_stake,
                                 source_wallet=vault_wallet,
-                                dest=sender,
+                                dest=origin_coldkey,
                                 wallet_password=wallet_password,
                             )
 
@@ -684,6 +685,7 @@ class CollateralManager:
         self,
         amount: int,  # pyright: ignore[reportRedeclaration]
         dest: str,
+        source_hotkey: str,
         vault_stake: str,
         vault_wallet: Wallet,
         owner_address: str,
@@ -700,6 +702,7 @@ class CollateralManager:
         Args:
             amount (int): The alpha token amount to withdraw in Rao unit.
             dest: (str): The destination SS58 address to withdraw the alpha tokens to.
+            source_hotkey (str): The source miner hotkey to withdraw the alpha tokens from.
             vault_stake (str): The stake's SS58 address of the vault to withdraw the alpha tokens from.
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
@@ -722,6 +725,9 @@ class CollateralManager:
         if not is_valid_ss58_address(dest):
             raise ValueError(f"Invalid destination SS58 address: {dest}")
 
+        if not is_valid_ss58_address(source_hotkey):
+            raise ValueError(f"Invalid source SS58 address: {source_hotkey}")
+
         if not is_valid_ss58_address(vault_stake):
             raise ValueError(f"Invalid stake SS58 address: {vault_stake}")
 
@@ -732,7 +738,7 @@ class CollateralManager:
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
-        if amount > (balance := Balance.from_rao(self.balance_of(dest), netuid=self.network.netuid)):
+        if amount > (balance := Balance.from_rao(self.balance_of(source_hotkey), netuid=self.network.netuid)):
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
         # 1. Withdraw the collateral from the EVM contract.
@@ -741,7 +747,7 @@ class CollateralManager:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
-                tx = contract.functions.withdraw(ss58_to_h160(dest), amount.rao).build_transaction(
+                tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
@@ -798,7 +804,7 @@ class CollateralManager:
                         try:
                             self.force_deposit(
                                 amount=amount.rao,
-                                address=dest,
+                                address=source_hotkey,
                                 owner_address=owner_address,
                                 owner_private_key=owner_private_key,
                             )
