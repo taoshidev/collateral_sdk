@@ -17,7 +17,7 @@ from web3 import Web3
 
 from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
-from .utils import ss58_to_h160
+from .utils import pubkey_to_ss58, ss58_to_h160
 
 
 class Network(Enum):
@@ -213,6 +213,7 @@ class CollateralManager:
         Returns:
             GenericExtrinsic: The decoded extrinsic.
         """
+
         extrinsic = GenericExtrinsic(
             data=ScaleBytes(data),
             metadata=self.subtensor_api.substrate.metadata,
@@ -238,7 +239,7 @@ class CollateralManager:
     def deposit(
         self,
         extrinsic: GenericExtrinsic,
-        sender: str,
+        source_hotkey: str,
         vault_stake: str,
         vault_wallet: Wallet,
         owner_address: str,
@@ -254,7 +255,7 @@ class CollateralManager:
 
         Args:
             extrinsic (GenericExtrinsic): The signed extrinsic for the stake transfer.
-            sender (str): The SS58 address of the sender of the deposit. This is used to revert the transfer.
+            source_hotkey (str): The source miner hotkey to deposit from.
             vault_stake (str): The stake's SS58 address of the vault to deposit the alpha tokens to.
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
@@ -271,7 +272,12 @@ class CollateralManager:
             If a critical error occurs, log the error and transfer the stake back to the source address manually!
         """
 
-        origin_coldkey = extrinsic.value["address"]
+        origin_coldkey = (
+            pubkey_to_ss58((extrinsic["address"].value))
+            if extrinsic["address"].value.startswith("0x") or extrinsic["address"].value.startswith("0X")
+            else extrinsic["address"].value
+        )
+
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
             destination_coldkey = call_args["destination_coldkey"].value
             destination_netuid = call_args["destination_netuid"].value
@@ -297,30 +303,28 @@ class CollateralManager:
                 f"The extrinsic's destination netuid {destination_netuid} does not match the network's netuid {self.network.netuid}"
             )
 
+        if origin_hotkey != source_hotkey:
+            raise ValueError(
+                f"The extrinsic's origin hotkey {origin_hotkey} does not match the source hotkey {source_hotkey}"
+            )
+
         if origin_netuid != self.network.netuid:
             raise ValueError(
                 f"The extrinsic's origin netuid {origin_netuid} does not match the network's netuid {self.network.netuid}"
             )
 
         # 1. Transfer the stake to the vault wallet.
-        for i in range(max_retries):
-            try:
-                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
-                    extrinsic,
-                    wait_for_inclusion=True,
-                )
+        try:
+            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                extrinsic,
+                wait_for_inclusion=True,
+            )
 
-                if result.is_success:
-                    break
-                else:
-                    raise ChainError.from_error(result.error_message)
+            if not result.is_success:
+                raise ChainError.from_error(result.error_message)
 
-            except BaseException as e:
-                if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
-                    continue
-                else:
-                    raise SubtensorError(f"Failed to transfer the stake to the vault wallet: {e}") from e
+        except BaseException as e:
+            raise SubtensorError(f"Failed to transfer the stake to the vault wallet: {e}") from e
 
         stake_added_event: dict = list(
             filter(lambda ev: ev["event"]["event_id"] == "StakeAdded", result.triggered_events)  # pyright: ignore[reportPossiblyUnboundVariable]
@@ -414,7 +418,7 @@ class CollateralManager:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
-                tx = contract.functions.deposit(ss58_to_h160(sender), stake_added.rao).build_transaction(
+                tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
@@ -684,7 +688,7 @@ class CollateralManager:
     def withdraw(
         self,
         amount: int,  # pyright: ignore[reportRedeclaration]
-        dest: str,
+        source_coldkey: str,
         source_hotkey: str,
         vault_stake: str,
         vault_wallet: Wallet,
@@ -701,8 +705,8 @@ class CollateralManager:
 
         Args:
             amount (int): The alpha token amount to withdraw in Rao unit.
-            dest: (str): The destination SS58 address to withdraw the alpha tokens to.
-            source_hotkey (str): The source miner hotkey to withdraw the alpha tokens from.
+            source_coldkey: (str): The source miner coldkey to withdraw the alpha tokens.
+            source_hotkey (str): The source miner hotkey to withdraw the alpha tokens.
             vault_stake (str): The stake's SS58 address of the vault to withdraw the alpha tokens from.
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
@@ -722,8 +726,8 @@ class CollateralManager:
         if amount <= 0:
             raise ValueError("Amount must be greater than zero: {amount}")
 
-        if not is_valid_ss58_address(dest):
-            raise ValueError(f"Invalid destination SS58 address: {dest}")
+        if not is_valid_ss58_address(source_coldkey):
+            raise ValueError(f"Invalid destination SS58 address: {source_coldkey}")
 
         if not is_valid_ss58_address(source_hotkey):
             raise ValueError(f"Invalid source SS58 address: {source_hotkey}")
@@ -773,15 +777,15 @@ class CollateralManager:
                 else:
                     raise EVMError(f"Failed to withdraw from the EVM contract: {e}") from e
 
-        # 2. Transfer the stake to the destination address.
+        # 2. Transfer the stake to the source coldkey.
         for i in range(max_retries):
             try:
                 transfer_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
                     amount=amount.rao,
                     source_stake=vault_stake,
                     source_wallet=vault_wallet,
-                    dest=dest,
-                    wallet_password=wallet_password
+                    dest=source_coldkey,
+                    wallet_password=wallet_password,
                 )
 
                 result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
