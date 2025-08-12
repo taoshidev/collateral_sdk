@@ -56,9 +56,9 @@ class Network(Enum):
         if self.value == Network.LOCAL.value:
             raise ValueError("Program address is not set for a local network. Please set it manually.")
         elif self.value == Network.MAINNET.value:
-            return "0xF3304Eb05D134b71EE5e40Db90ECe5C5c8C43B84"
+            return "0xdb2e064f877b27Fcc83fb0DE98e718785aEdd072"
         elif self.value == Network.TESTNET.value:
-            return "0x0E35E8aCA3c18280b62df50415bd64c58635e857"
+            return "0x1a8C4c72D97b983C77BDa833883802145ecFD477"
         else:
             raise ValueError(f"Unknown network: {self}")
 
