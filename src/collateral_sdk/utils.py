@@ -1,70 +1,29 @@
-import bittensor
-import bittensor.utils
+from bittensor.utils import is_valid_ss58_address, ss58_address_to_bytes
 from eth_typing import ChecksumAddress
-from scalecodec import ss58_decode, ss58_encode
 from web3 import Web3
-
-
-def pubkey_to_h160(pubkey: str) -> ChecksumAddress:
-    """
-    Convert a public key to an H160 address.
-
-    Args:
-        pubkey (str): The public key to convert.
-
-    Returns:
-        ChecksumAddress: The corresponding H160 address.
-    """
-
-    if pubkey.startswith("0x") or pubkey.startswith("0X"):
-        pubkey = pubkey[2:]
-
-    # Take the first 20 bytes (40 hex characters) of the public key.
-    address = "0x" + pubkey[:40]
-
-    return Web3.to_checksum_address(address)
-
-
-def pubkey_to_ss58(pubkey: str) -> str:
-    """
-    Convert a public key to an SS58 address.
-
-    Args:
-        pubkey (str): The public key to convert.
-
-    Returns:
-        str: The corresponding SS58 address.
-    """
-
-    return ss58_encode(pubkey)
 
 
 def ss58_to_h160(address: str) -> ChecksumAddress:
     """
-    Convert an SS58 address to an H160 address.
+    Convert an SS58 address to an H160 address (with EIP55 checksum).
 
     Args:
-        address (str): The SS58 address to convert.
+        address (str): An SS58 address to convert.
 
     Returns:
-        ChecksumAddress: The corresponding H160 address.
+        ChecksumAddress: The corresponding H160 address with EIP55 checksum format.
+
+    Caveat:
+        This function converts an SS58 address to an H160 address by truncating the first 20 bytes of the AccountId32.
+        This only applies to Subtensor substrate chain.
     """
 
-    pubkey_bytes = bittensor.utils.ss58_address_to_bytes(address)
-    pubkey = pubkey_bytes.hex()
+    if not is_valid_ss58_address(address):
+        raise ValueError(f"Invalid SS58 address: {address}")
 
-    return pubkey_to_h160(pubkey)
+    account_id_bytes = ss58_address_to_bytes(address)
+    account_id_hex = account_id_bytes.hex()
 
-
-def ss58_to_pubkey(address: str) -> str:
-    """
-    Convert an SS58 address to a public key.
-
-    Args:
-        address (str): The SS58 address to convert.
-
-    Returns:
-        str: The corresponding public key.
-    """
-
-    return f"0x{ss58_decode(address)}"
+    # Take the first 20 bytes (40 hex characters) of the AccountId32.
+    # Refer to https://github.com/gztensor/precompile-examples/blob/3680e830f1a1e90a2328410fd86255b6b184d4b7/src/util/eth-helpers.js#L55
+    return Web3.to_checksum_address(account_id_hex[:40])

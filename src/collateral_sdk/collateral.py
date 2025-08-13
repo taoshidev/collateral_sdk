@@ -12,12 +12,13 @@ from bittensor.core.subtensor_api import SubtensorApi
 from bittensor.utils import is_valid_ss58_address
 from bittensor.utils.balance import Balance
 from bittensor_wallet import Wallet
+from scalecodec import ss58_encode
 from scalecodec.types import GenericCall, GenericExtrinsic, ScaleBytes
 from web3 import Web3
 
 from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
-from .utils import pubkey_to_ss58, ss58_to_h160
+from .utils import ss58_to_h160
 
 
 class Network(Enum):
@@ -91,7 +92,8 @@ class CollateralManager:
 
     Args:
         network (Network): The network to use for collateral operations. Defaults to Network.TESTNET.
-        program_address (Optional[str]): The address of the EVM contract for collateral operations. Defaults to the network's EVM program address.
+        program_address (Optional[str]): The address of the EVM contract for collateral operations.
+                                         Defaults to the already-deployed and trusted program address.
     """
 
     def __init__(
@@ -102,6 +104,15 @@ class CollateralManager:
         with open(Path(abi.__path__[0]) / "Collateral.abi.json", "r") as f:
             self.abi: Any = json.load(f)
 
+        if program_address is not None:
+            try:
+                program_address = Web3.to_checksum_address(program_address)
+                web3 = Web3(Web3.HTTPProvider(network.evm_endpoint))
+                contract = web3.eth.contract(program_address, abi=self.abi)
+                contract.functions.getTotalCollateral().call()
+            except Exception:
+                raise ValueError(f"Invalid program address: {program_address}")
+
         self.network = network
         self.program_address = program_address or network.evm_program_address
         self._subtensor_api = None
@@ -111,6 +122,28 @@ class CollateralManager:
         if self._subtensor_api is None:
             self._subtensor_api = SubtensorApi(network=self.network.subtensor_network)
         return self._subtensor_api
+
+    def _get_stake_added_amount(self, events: list[dict]) -> Balance:
+        """
+        Extract the stake added amount from the triggered events.
+
+        Args:
+            events (list[dict]): The list of triggered events.
+
+        Returns:
+            Balance: The stake added amount in Rao unit.
+        """
+
+        try:
+            stake_added_event = next((ev for ev in events if ev["event"]["event_id"] == "StakeAdded"))
+            stake_added_amount = stake_added_event["event"]["attributes"][3]
+        except (IndexError, KeyError, StopIteration):
+            raise ValueError(f"Failed to extract the stake added amount from the triggered events: {events}")
+
+        return Balance.from_rao(
+            stake_added_amount - 1,  # -1 is temporary fix for accuracy. Without this, the balance may be off by 1 Rao.
+            netuid=self.network.netuid,
+        )
 
     def balance_of(self, address: str) -> int:
         """
@@ -247,7 +280,6 @@ class CollateralManager:
         wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
-        max_reverts: int = 3,
     ) -> Balance:
         """
         Submit the extrinsic to the Subtensor network and deposit the alpha tokens into the EVM contract.
@@ -261,22 +293,35 @@ class CollateralManager:
             owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
             wallet_password (Optional[str]): The password for the source wallet.
-            max_backoff (float): The maximum backoff time in seconds for retries/reverts. Defaults to 30.0.
+            max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
-            max_reverts (int): The maximum number of attempts to revert. Defaults to 3.
 
         Returns:
             Balance: The amount of alpha tokens deposited.
 
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
+
         IMPORTANT:
             If a critical error occurs, log the error and transfer the stake back to the source address manually!
+
         """
 
         origin_coldkey = (
-            pubkey_to_ss58((extrinsic["address"].value))
+            ss58_encode((extrinsic["address"].value))
             if extrinsic["address"].value.startswith("0x") or extrinsic["address"].value.startswith("0X")
             else extrinsic["address"].value
         )
+
+        if (
+            extrinsic["call"]["call_module"]["name"].value != "SubtensorModule"
+            and extrinsic["call"]["call_function"]["name"].value != "transfer_stake"
+        ):
+            raise ValueError(
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{extrinsic['call']['call_module']['name'].value}.{extrinsic['call']['call_function']['name'].value}'"
+            )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
             destination_coldkey = call_args["destination_coldkey"].value
@@ -290,7 +335,7 @@ class CollateralManager:
                 destination_netuid = next(arg for arg in call_args if arg["name"] == "destination_netuid")["value"]
                 origin_hotkey = next(arg for arg in call_args if arg["name"] == "hotkey")["value"]
                 origin_netuid = next(arg for arg in call_args if arg["name"] == "origin_netuid")["value"]
-            except StopAsyncIteration:
+            except StopIteration:
                 raise ValueError("Invalid extrinsic: missing required call arguments")
 
         if destination_coldkey != vault_wallet.coldkeypub.ss58_address:
@@ -315,30 +360,28 @@ class CollateralManager:
 
         # 1. Transfer the stake to the vault wallet.
         try:
+            # Default RPC retries is 5 and RPC timeout is 60 seconds, which are configured in SubstrateInterface's __init__().
+            # No need to retry login here.
             result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
                 extrinsic,
                 wait_for_inclusion=True,
             )
 
-            if not result.is_success:
+            if result.is_success:
+                try:
+                    stake_added = self._get_stake_added_amount(result.triggered_events)
+                except ValueError:
+                    raise CriticalError("A stake has been transferred, but the amount is unknown")
+            else:
                 raise ChainError.from_error(result.error_message)
 
-        except BaseException as e:
+        except CriticalError:
+            raise
+        except Exception as e:
             raise SubtensorError(f"Failed to transfer the stake to the vault wallet: {e}") from e
 
-        stake_added_event: dict = list(
-            filter(lambda ev: ev["event"]["event_id"] == "StakeAdded", result.triggered_events)  # pyright: ignore[reportPossiblyUnboundVariable]
-        )[0]["event"]
-        stake_added = Balance.from_rao(
-            stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy
-            netuid=self.network.netuid,
-        )
-
         # 2. Move the stake to the vault's stake address.
-        for i in range(max_retries):
-            if origin_hotkey == vault_stake:
-                break
-
+        if origin_hotkey != vault_stake:
             try:
                 move_call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
                     call_module="SubtensorModule",
@@ -363,54 +406,40 @@ class CollateralManager:
                 )
 
                 if result.is_success:
-                    break
+                    try:
+                        stake_added = self._get_stake_added_amount(result.triggered_events)
+                    except ValueError:
+                        raise CriticalError("A stake has been transferred and moved, but the amount is unknown")
                 else:
                     raise ChainError.from_error(result.error_message)
 
-            except BaseException as e:
-                if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
-                    continue
-                else:
-                    # 3. Revert the stake transfer if the stake move fails.
-                    for j in range(max_reverts):
-                        try:
-                            revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                                amount=stake_added.rao,
-                                source_stake=origin_hotkey,
-                                source_wallet=vault_wallet,
-                                dest=origin_coldkey,
-                                wallet_password=wallet_password,
-                            )
+            except CriticalError:
+                raise
+            except Exception as e:
+                # 3. Revert the stake transfer if the stake move fails.
+                try:
+                    revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                        amount=stake_added.rao,
+                        source_stake=origin_hotkey,
+                        source_wallet=vault_wallet,
+                        dest=origin_coldkey,
+                        wallet_password=wallet_password,
+                    )
 
-                            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
-                                revert_extrinsic,
-                                wait_for_inclusion=True,
-                            )
+                    result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                        revert_extrinsic,
+                        wait_for_inclusion=True,
+                    )
 
-                            if result.is_success:
-                                break
-                            else:
-                                raise ChainError.from_error(result.error_message)
+                    if not result.is_success:
+                        raise ChainError.from_error(result.error_message)
 
-                        except BaseException as e:
-                            if j < max_reverts - 1:
-                                time.sleep(max(2**j, max_backoff))
-                                continue
-                            else:
-                                # When the revert fails, raise a critical error.
-                                raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
+                except Exception as e:
+                    # When the revert fails, raise a critical error.
+                    raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
 
-                    # After reverting the stake transfer, raise an error for the stake move failure.
-                    raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
-
-        stake_added_event: dict = list(
-            filter(lambda ev: ev["event"]["event_id"] == "StakeAdded", result.triggered_events)  # pyright: ignore[reportPossiblyUnboundVariable]
-        )[0]["event"]
-        stake_added = Balance.from_rao(
-            stake_added_event["attributes"][3] - 1,  # -1 is temporary fix for accuracy,
-            netuid=self.network.netuid,
-        )
+                # After reverting the stake transfer, raise an error for the stake move failure.
+                raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
 
         # 4. Deposit the collateral into the EVM contract.
         for i in range(max_retries):
@@ -422,7 +451,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -437,39 +466,32 @@ class CollateralManager:
                         f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
                     )
 
-            except BaseException as e:
+            except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     # 4. Revert the stake transfer if deposit in the EVM fails.
-                    for j in range(max_reverts):
-                        try:
-                            revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                                amount=stake_added.rao,
-                                source_stake=vault_stake,
-                                source_wallet=vault_wallet,
-                                dest=origin_coldkey,
-                                wallet_password=wallet_password,
-                            )
+                    try:
+                        revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                            amount=stake_added.rao,
+                            source_stake=vault_stake,
+                            source_wallet=vault_wallet,
+                            dest=origin_coldkey,
+                            wallet_password=wallet_password,
+                        )
 
-                            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
-                                revert_extrinsic,
-                                wait_for_inclusion=True,
-                            )
+                        result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                            revert_extrinsic,
+                            wait_for_inclusion=True,
+                        )
 
-                            if result.is_success:
-                                break
-                            else:
-                                raise ChainError.from_error(result.error_message)
+                        if not result.is_success:
+                            raise ChainError.from_error(result.error_message)
 
-                        except BaseException as e:
-                            if j < max_reverts - 1:
-                                time.sleep(max(2**j, max_backoff))
-                                continue
-                            else:
-                                # When the revert fails, raise a critical error.
-                                raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
+                    except Exception as e:
+                        # When the revert fails, raise a critical error.
+                        raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
 
                     # After reverting the stake transfer, raise an error for the deposit failure.
                     raise EVMError(f"Failed to deposit into the EVM contract: {e}") from e
@@ -499,7 +521,15 @@ class CollateralManager:
 
         Returns:
             None
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
         """
+
+        if not is_valid_ss58_address(address):
+            raise ValueError(f"Invalid SS58 address: {address}")
 
         for i in range(max_retries):
             try:
@@ -525,9 +555,9 @@ class CollateralManager:
                         f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
                     )
 
-            except BaseException as e:
+            except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise EVMError(f"Failed to force deposit into the EVM contract: {e}") from e
@@ -555,7 +585,15 @@ class CollateralManager:
 
         Returns:
             None
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
         """
+
+        if not is_valid_ss58_address(address):
+            raise ValueError(f"Invalid SS58 address: {address}")
 
         for i in range(max_retries):
             try:
@@ -581,9 +619,9 @@ class CollateralManager:
                         f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
                     )
 
-            except BaseException as e:
+            except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise EVMError(f"Failed to force withdraw from the EVM contract: {e}") from e
@@ -639,6 +677,11 @@ class CollateralManager:
 
         Returns:
             Balance: The amount of alpha tokens slashed.
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
         """
 
         if not is_valid_ss58_address(address):
@@ -676,9 +719,9 @@ class CollateralManager:
                         f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
                     )
 
-            except BaseException as e:
+            except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise EVMError(f"Failed to slash from the EVM contract: {e}") from e
@@ -697,7 +740,6 @@ class CollateralManager:
         wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
-        max_reverts: int = 3,
     ) -> Balance:
         """
         Submit the extrinsic to the Subtensor network and withdraw the alpha tokens from the EVM contract.
@@ -712,12 +754,16 @@ class CollateralManager:
             owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
             wallet_password (Optional[str]): The password for the source wallet.
-            max_backoff (float): The maximum backoff time in seconds for retries/reverts. Defaults to 30.0.
+            max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
-            max_reverts (int): The maximum number of attempts to revert. Defaults to 3.
 
         Returns:
             Balance: The amount of alpha tokens withdrawn.
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
 
         IMPORTANT:
             If a critical error occurs, log the error and force deposit the withdrawn amount back to the destination address manually!
@@ -770,61 +816,46 @@ class CollateralManager:
                         f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
                     )
 
-            except BaseException as e:
+            except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise EVMError(f"Failed to withdraw from the EVM contract: {e}") from e
 
         # 2. Transfer the stake to the source coldkey.
-        for i in range(max_retries):
+        try:
+            transfer_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                amount=amount.rao,
+                source_stake=vault_stake,
+                source_wallet=vault_wallet,
+                dest=source_coldkey,
+                wallet_password=wallet_password,
+            )
+
+            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                transfer_extrinsic,
+                wait_for_inclusion=True,
+            )
+
+            if not result.is_success:
+                raise ChainError.from_error(result.error_message)
+
+        except Exception as e:
+            # 3. Revert the withdrawal if the stake transfer fails.
             try:
-                transfer_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                self.force_deposit(
                     amount=amount.rao,
-                    source_stake=vault_stake,
-                    source_wallet=vault_wallet,
-                    dest=source_coldkey,
-                    wallet_password=wallet_password,
+                    address=source_hotkey,
+                    owner_address=owner_address,
+                    owner_private_key=owner_private_key,
                 )
 
-                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
-                    transfer_extrinsic,
-                    wait_for_inclusion=True,
-                )
+            except Exception as e:
+                # When the revert fails, raise a critical error.
+                raise CriticalError(f"Failed to revert the withdrawal from the EVM contract: {e}") from e
 
-                if result.is_success:
-                    break
-                else:
-                    raise ChainError.from_error(result.error_message)
-
-            except BaseException as e:
-                if i < max_retries - 1:
-                    time.sleep(max(2**i, max_backoff))
-                    continue
-                else:
-                    # 3. Revert the withdrawal if the stake transfer fails.
-                    for j in range(max_reverts):
-                        try:
-                            self.force_deposit(
-                                amount=amount.rao,
-                                address=source_hotkey,
-                                owner_address=owner_address,
-                                owner_private_key=owner_private_key,
-                            )
-                            break
-
-                        except BaseException as e:
-                            if j < max_reverts - 1:
-                                time.sleep(max(2**j, max_backoff))
-                                continue
-                            else:
-                                # When the revert fails, raise a critical error.
-                                raise CriticalError(
-                                    f"Failed to revert the withdrawal from the EVM contract: {e}"
-                                ) from e
-
-                    # After reverting the withdrawal, raise an error for the stake transfer failure.
-                    raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
+            # After reverting the withdrawal, raise an error for the stake transfer failure.
+            raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
 
         return amount
