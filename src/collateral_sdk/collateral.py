@@ -18,7 +18,7 @@ from web3 import Web3
 
 from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
-from .utils import load_keyfile, ss58_to_h160
+from .utils import ss58_to_h160
 
 
 class Network(Enum):
@@ -273,10 +273,10 @@ class CollateralManager:
         self,
         extrinsic: GenericExtrinsic,
         source_hotkey: str,
-        keyfile_path: str | Path,
-        keyfile_password: str,
         vault_stake: str,
         vault_wallet: Wallet,
+        owner_address: str,
+        owner_private_key: str,
         wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
@@ -288,10 +288,9 @@ class CollateralManager:
         Args:
             extrinsic (GenericExtrinsic): The signed extrinsic for the stake transfer.
             source_hotkey (str): The source miner hotkey to deposit from.
-            keyfile_path (str | Path): The path to the eth keyfile.
-            keyfile_password (str): The password to decrypt the eth keyfile.
             vault_stake (str): The stake's SS58 address of the vault to deposit the alpha tokens to.
             vault_wallet (Wallet): The wallet of the vault.
+            owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
             wallet_password (Optional[str]): The password for the source wallet.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
@@ -447,7 +446,6 @@ class CollateralManager:
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-                owner_address, owner_private_key = load_keyfile(keyfile_path, keyfile_password)
 
                 tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
                     {
@@ -504,8 +502,8 @@ class CollateralManager:
         self,
         address: str,
         amount: int,
-        keyfile_path: str | Path,
-        keyfile_password: str,
+        owner_address: str,
+        owner_private_key: str,
         max_backoff: float = 30.0,
         max_retries: int = 3,
     ) -> None:
@@ -516,8 +514,8 @@ class CollateralManager:
         Args:
             address (str): The SS58 address to deposit to.
             amount (int): The amount of alpha tokens to deposit in Rao unit.
-            keyfile_path (str | Path): The path to the eth keyfile.
-            keyfile_password (str): The password to decrypt the eth keyfile.
+            owner_address (str): The owner address the EVM contract.
+            owner_private_key (str): The private key of the owner.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3
 
@@ -537,7 +535,6 @@ class CollateralManager:
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-                owner_address, owner_private_key = load_keyfile(keyfile_path, keyfile_password)
 
                 tx = contract.functions.deposit(ss58_to_h160(address), amount).build_transaction(
                     {
@@ -569,8 +566,8 @@ class CollateralManager:
         self,
         address: str,
         amount: int,
-        keyfile_path: str | Path,
-        keyfile_password: str,
+        owner_address: str,
+        owner_private_key: str,
         max_backoff: float = 30.0,
         max_retries: int = 3,
     ) -> None:
@@ -581,8 +578,8 @@ class CollateralManager:
         Args:
             address (str): The SS58 address to withdraw from.
             amount (int): The amount of alpha tokens to withdraw in Rao unit.
-            keyfile_path (str | Path): The path to the eth keyfile.
-            keyfile_password (str): The password to decrypt the eth keyfile.
+            owner_address (str): The owner address the EVM contract.
+            owner_private_key (str): The private key of the owner.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3
 
@@ -602,7 +599,6 @@ class CollateralManager:
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-                owner_address, owner_private_key = load_keyfile(keyfile_path, keyfile_password)
 
                 tx = contract.functions.withdraw(ss58_to_h160(address), amount).build_transaction(
                     {
@@ -662,8 +658,8 @@ class CollateralManager:
         self,
         address: str,
         amount: int,  # pyright: ignore[reportRedeclaration]
-        keyfile_path: str | Path,
-        keyfile_password: str,
+        owner_address: str,
+        owner_private_key: str,
         max_backoff: float = 30.0,
         max_retries: int = 3,
     ) -> Balance:
@@ -674,8 +670,8 @@ class CollateralManager:
         Args:
             address (str): The SS58 address to slash from.
             amount (float): The amount of alpha tokens to slash in Rao unit.
-            keyfile_path (str | Path): The path to the eth keyfile.
-            keyfile_password (str): The password to decrypt the eth keyfile.
+            owner_address (str): The owner address the EVM contract.
+            owner_private_key (str): The private key of the owner.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
 
@@ -703,7 +699,6 @@ class CollateralManager:
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-                owner_address, owner_private_key = load_keyfile(keyfile_path, keyfile_password)
 
                 tx = contract.functions.slash(ss58_to_h160(address), amount.rao).build_transaction(
                     {
@@ -738,10 +733,10 @@ class CollateralManager:
         amount: int,  # pyright: ignore[reportRedeclaration]
         source_coldkey: str,
         source_hotkey: str,
-        keyfile_path: str | Path,
-        keyfile_password: str,
         vault_stake: str,
         vault_wallet: Wallet,
+        owner_address: str,
+        owner_private_key: str,
         wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
@@ -754,10 +749,10 @@ class CollateralManager:
             amount (int): The alpha token amount to withdraw in Rao unit.
             source_coldkey: (str): The source miner coldkey to withdraw the alpha tokens.
             source_hotkey (str): The source miner hotkey to withdraw the alpha tokens.
-            keyfile_path (str | Path): The path to the eth keyfile.
-            keyfile_password (str): The password to decrypt the eth keyfile.
             vault_stake (str): The stake's SS58 address of the vault to withdraw the alpha tokens from.
             vault_wallet (Wallet): The wallet of the vault.
+            owner_address (str): The owner address the EVM contract.
+            owner_private_key (str): The private key of the owner.
             wallet_password (Optional[str]): The password for the source wallet.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
@@ -801,7 +796,6 @@ class CollateralManager:
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-                owner_address, owner_private_key = load_keyfile(keyfile_path, keyfile_password)
 
                 tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
                     {
@@ -853,8 +847,8 @@ class CollateralManager:
                 self.force_deposit(
                     amount=amount.rao,
                     address=source_hotkey,
-                    keyfile_path=keyfile_path,
-                    keyfile_password=keyfile_password,
+                    owner_address=owner_address,
+                    owner_private_key=owner_private_key,
                 )
 
             except Exception as e:
