@@ -315,12 +315,14 @@ class CollateralManager:
             else extrinsic["address"].value
         )
 
-        if (
-            extrinsic["call"]["call_module"]["name"].value != "SubtensorModule"
-            and extrinsic["call"]["call_function"]["name"].value != "transfer_stake"
-        ):
+        call = extrinsic["call"]
+        module_name = call["call_module"]["name"].value
+        function_name = call["call_function"]["name"].value
+
+        if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
             raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{extrinsic['call']['call_module']['name'].value}.{extrinsic['call']['call_function']['name'].value}'"
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', "
+                f"got '{module_name}.{function_name}'"
             )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
