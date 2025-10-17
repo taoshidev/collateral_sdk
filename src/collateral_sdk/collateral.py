@@ -154,22 +154,24 @@ class CollateralManager:
     @property
     def web3(self) -> Web3:
         """Get Web3 instance (cached for performance)."""
-        if not hasattr(self, '_web3') or self._web3 is None:
+        if not hasattr(self, "_web3") or self._web3 is None:
             self._web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
         return self._web3
 
     @property
     def collateral_contract(self):
         """Get main collateral contract instance (cached for performance)."""
-        if not hasattr(self, '_collateral_contract') or self._collateral_contract is None:
+        if not hasattr(self, "_collateral_contract") or self._collateral_contract is None:
             self._collateral_contract = self.web3.eth.contract(self.program_address, abi=self.abi)
         return self._collateral_contract
 
     @property
     def contributor_contract(self):
         """Get contributor collateral contract instance (cached for performance)."""
-        if not hasattr(self, '_contributor_contract') or self._contributor_contract is None:
-            self._contributor_contract = self.web3.eth.contract(self.contributor_program_address, abi=self.contributor_abi)
+        if not hasattr(self, "_contributor_contract") or self._contributor_contract is None:
+            self._contributor_contract = self.web3.eth.contract(
+                self.contributor_program_address, abi=self.contributor_abi
+            )
         return self._contributor_contract
 
     def _get_stake_added_amount(self, events: list[dict]) -> Balance:
@@ -367,8 +369,7 @@ class CollateralManager:
 
         if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
             raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', "
-                f"got '{module_name}.{function_name}'"
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{module_name}.{function_name}'"
             )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
@@ -492,7 +493,9 @@ class CollateralManager:
         # 4. Deposit the collateral into the EVM contract.
         for i in range(max_retries):
             try:
-                tx = self.collateral_contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
+                tx = self.collateral_contract.functions.deposit(
+                    ss58_to_h160(source_hotkey), stake_added.rao
+                ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
@@ -824,7 +827,9 @@ class CollateralManager:
         # 1. Withdraw the collateral from the EVM contract.
         for i in range(max_retries):
             try:
-                tx = self.collateral_contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
+                tx = self.collateral_contract.functions.withdraw(
+                    ss58_to_h160(source_hotkey), amount.rao
+                ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
@@ -909,7 +914,9 @@ class CollateralManager:
         if not is_valid_ss58_address(contributor_address):
             raise ValueError(f"Invalid contributor SS58 address: {contributor_address}")
 
-        balance = self.contributor_contract.functions.contributorBalance(ss58_to_h160(miner_address), ss58_to_h160(contributor_address)).call()
+        balance = self.contributor_contract.functions.contributorBalance(
+            ss58_to_h160(miner_address), ss58_to_h160(contributor_address)
+        ).call()
         return balance
 
     def contributor_miner_total(self, miner_address: str) -> int:
@@ -1030,8 +1037,7 @@ class CollateralManager:
 
         if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
             raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', "
-                f"got '{module_name}.{function_name}'"
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{module_name}.{function_name}'"
             )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
@@ -1154,9 +1160,7 @@ class CollateralManager:
         for i in range(max_retries):
             try:
                 tx = self.contributor_contract.functions.depositFor(
-                    ss58_to_h160(miner_address), 
-                    ss58_to_h160(contributor_address), 
-                    stake_added.rao
+                    ss58_to_h160(miner_address), ss58_to_h160(contributor_address), stake_added.rao
                 ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
@@ -1273,16 +1277,18 @@ class CollateralManager:
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
-        if amount > (balance := Balance.from_rao(self.contributor_balance(miner_address, contributor_address), netuid=self.network.netuid)):
+        if amount > (
+            balance := Balance.from_rao(
+                self.contributor_balance(miner_address, contributor_address), netuid=self.network.netuid
+            )
+        ):
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
         # 1. Withdraw the collateral from the contributor EVM contract.
         for i in range(max_retries):
             try:
                 tx = self.contributor_contract.functions.withdrawFor(
-                    ss58_to_h160(miner_address), 
-                    ss58_to_h160(contributor_address), 
-                    amount.rao
+                    ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount.rao
                 ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
@@ -1391,9 +1397,7 @@ class CollateralManager:
         for i in range(max_retries):
             try:
                 tx = self.contributor_contract.functions.depositFor(
-                    ss58_to_h160(miner_address), 
-                    ss58_to_h160(contributor_address), 
-                    amount
+                    ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount
                 ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
@@ -1464,9 +1468,7 @@ class CollateralManager:
         for i in range(max_retries):
             try:
                 tx = self.contributor_contract.functions.withdrawFor(
-                    ss58_to_h160(miner_address), 
-                    ss58_to_h160(contributor_address), 
-                    amount
+                    ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount
                 ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
@@ -1536,15 +1538,17 @@ class CollateralManager:
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
-        if amount > (balance := Balance.from_rao(self.contributor_balance(miner_address, contributor_address), netuid=self.network.netuid)):
+        if amount > (
+            balance := Balance.from_rao(
+                self.contributor_balance(miner_address, contributor_address), netuid=self.network.netuid
+            )
+        ):
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
         for i in range(max_retries):
             try:
                 tx = self.contributor_contract.functions.slashFromContributor(
-                    ss58_to_h160(miner_address), 
-                    ss58_to_h160(contributor_address), 
-                    amount.rao
+                    ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount.rao
                 ).build_transaction(
                     {
                         "chainId": self.network.evm_chain_id,
