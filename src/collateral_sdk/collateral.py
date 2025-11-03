@@ -138,7 +138,6 @@ class CollateralManager:
             self._collateral_contract = self.web3.eth.contract(self.program_address, abi=self.abi)
         return self._collateral_contract
 
-
     def _get_stake_added_amount(self, events: list[dict]) -> Balance:
         """
         Extract the stake added amount from the triggered events.
