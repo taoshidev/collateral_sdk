@@ -64,17 +64,6 @@ class Network(Enum):
             raise ValueError(f"Unknown network: {self}")
 
     @property
-    def evm_contributor_program_address(self) -> str:
-        if self.value == Network.LOCAL.value:
-            raise ValueError("Contributor program address is not set for a local network. Please set it manually.")
-        elif self.value == Network.MAINNET.value:
-            return "0xdb2e064f877b27Fcc83fb0DE98e718785aEdd072"  # TODO: Update with actual contributor contract address
-        elif self.value == Network.TESTNET.value:
-            return "0x1a8C4c72D97b983C77BDa833883802145ecFD477"  # TODO: Update with actual contributor contract address
-        else:
-            raise ValueError(f"Unknown network: {self}")
-
-    @property
     def netuid(self) -> int:
         if self.value == Network.LOCAL.value:
             raise ValueError("Netuid is not set for a local network. Please set it manually.")
@@ -106,21 +95,15 @@ class CollateralManager:
         network (Network): The network to use for collateral operations. Defaults to Network.TESTNET.
         program_address (Optional[str]): The address of the EVM contract for collateral operations.
                                          Defaults to the already-deployed and trusted program address.
-        contributor_program_address (Optional[str]): The address of the EVM contract for contributor operations.
-                                                 Defaults to the already-deployed and trusted contributor program address.
     """
 
     def __init__(
         self,
         network: Network = Network.TESTNET,
         program_address: Optional[str] = None,
-        contributor_program_address: Optional[str] = None,
     ):
         with open(Path(abi.__path__[0]) / "Collateral.abi.json", "r") as f:
             self.abi: Any = json.load(f)
-
-        with open(Path(abi.__path__[0]) / "CollateralContributor.abi.json", "r") as f:
-            self.contributor_abi: Any = json.load(f)
 
         if program_address is not None:
             try:
@@ -131,18 +114,8 @@ class CollateralManager:
             except Exception:
                 raise ValueError(f"Invalid program address: {program_address}")
 
-        if contributor_program_address is not None:
-            try:
-                contributor_program_address = Web3.to_checksum_address(contributor_program_address)
-                web3 = Web3(Web3.HTTPProvider(network.evm_endpoint))
-                contract = web3.eth.contract(contributor_program_address, abi=self.contributor_abi)
-                contract.functions.totalCollateral().call()
-            except Exception:
-                raise ValueError(f"Invalid contributor program address: {contributor_program_address}")
-
         self.network = network
         self.program_address = program_address or network.evm_program_address
-        self.contributor_program_address = contributor_program_address or network.evm_contributor_program_address
         self._subtensor_api = None
 
     @property
@@ -165,14 +138,6 @@ class CollateralManager:
             self._collateral_contract = self.web3.eth.contract(self.program_address, abi=self.abi)
         return self._collateral_contract
 
-    @property
-    def contributor_contract(self):
-        """Get contributor collateral contract instance (cached for performance)."""
-        if not hasattr(self, "_contributor_contract") or self._contributor_contract is None:
-            self._contributor_contract = self.web3.eth.contract(
-                self.contributor_program_address, abi=self.contributor_abi
-            )
-        return self._contributor_contract
 
     def _get_stake_added_amount(self, events: list[dict]) -> Balance:
         """
@@ -914,7 +879,7 @@ class CollateralManager:
         if not is_valid_ss58_address(contributor_address):
             raise ValueError(f"Invalid contributor SS58 address: {contributor_address}")
 
-        balance = self.contributor_contract.functions.contributorBalance(
+        balance = self.collateral_contract.functions.contributorBalance(
             ss58_to_h160(miner_address), ss58_to_h160(contributor_address)
         ).call()
         return balance
@@ -933,7 +898,7 @@ class CollateralManager:
         if not is_valid_ss58_address(miner_address):
             raise ValueError(f"Invalid miner SS58 address: {miner_address}")
 
-        total = self.contributor_contract.functions.minerTotalCollateral(ss58_to_h160(miner_address)).call()
+        total = self.collateral_contract.functions.minerTotalCollateral(ss58_to_h160(miner_address)).call()
         return total
 
     def contributor_miner_slashed(self, miner_address: str) -> int:
@@ -950,29 +915,29 @@ class CollateralManager:
         if not is_valid_ss58_address(miner_address):
             raise ValueError(f"Invalid miner SS58 address: {miner_address}")
 
-        slashed = self.contributor_contract.functions.minerSlashedCollateral(ss58_to_h160(miner_address)).call()
+        slashed = self.collateral_contract.functions.minerSlashedCollateral(ss58_to_h160(miner_address)).call()
         return slashed
 
     def contributor_total(self) -> int:
         """
-        Get the total amount of collateral in the contributor EVM contract across all miners and contributors.
+        Get the total amount of collateral in the EVM contract across all miners and contributors.
 
         Returns:
             int: The total amount of collateral in Rao unit.
         """
 
-        balance = self.contributor_contract.functions.totalCollateral().call()
+        balance = self.collateral_contract.functions.totalCollateral().call()
         return balance
 
     def contributor_slashed(self) -> int:
         """
-        Get the total amount of slashed collateral in the contributor EVM contract.
+        Get the total amount of slashed collateral in the EVM contract.
 
         Returns:
             int: The total amount of slashed collateral in Rao unit.
         """
 
-        balance = self.contributor_contract.functions.slashedCollateral().call()
+        balance = self.collateral_contract.functions.slashedCollateral().call()
         return balance
 
     def contributor_deposit(
@@ -990,7 +955,7 @@ class CollateralManager:
         max_retries: int = 3,
     ) -> Balance:
         """
-        Submit the extrinsic to the Subtensor network and deposit the alpha tokens into the contributor EVM contract.
+        Submit the extrinsic to the Subtensor network and deposit the alpha tokens into the EVM contract.
         This function should be called on the owner validator side.
 
         Args:
@@ -1156,10 +1121,10 @@ class CollateralManager:
                 # After reverting the stake transfer, raise an error for the stake move failure.
                 raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
 
-        # 4. Deposit the collateral into the contributor EVM contract.
+        # 4. Deposit the collateral into the EVM contract.
         for i in range(max_retries):
             try:
-                tx = self.contributor_contract.functions.depositFor(
+                tx = self.collateral_contract.functions.depositFor(
                     ss58_to_h160(miner_address), ss58_to_h160(contributor_address), stake_added.rao
                 ).build_transaction(
                     {
@@ -1208,7 +1173,7 @@ class CollateralManager:
                         raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
 
                     # After reverting the stake transfer, raise an error for the deposit failure.
-                    raise EVMError(f"Failed to deposit into the contributor EVM contract: {e}") from e
+                    raise EVMError(f"Failed to deposit into the EVM contract: {e}") from e
 
         return stake_added
 
@@ -1228,7 +1193,7 @@ class CollateralManager:
         max_retries: int = 3,
     ) -> Balance:
         """
-        Submit the extrinsic to the Subtensor network and withdraw the alpha tokens from the contributor EVM contract.
+        Submit the extrinsic to the Subtensor network and withdraw the alpha tokens from the EVM contract.
         This function should be called on the owner validator side.
 
         Args:
@@ -1284,10 +1249,10 @@ class CollateralManager:
         ):
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
-        # 1. Withdraw the collateral from the contributor EVM contract.
+        # 1. Withdraw the collateral from the EVM contract.
         for i in range(max_retries):
             try:
-                tx = self.contributor_contract.functions.withdrawFor(
+                tx = self.collateral_contract.functions.withdrawFor(
                     ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount.rao
                 ).build_transaction(
                     {
@@ -1313,7 +1278,7 @@ class CollateralManager:
                     time.sleep(min(2**i, max_backoff))
                     continue
                 else:
-                    raise EVMError(f"Failed to withdraw from the contributor EVM contract: {e}") from e
+                    raise EVMError(f"Failed to withdraw from the EVM contract: {e}") from e
 
         # 2. Transfer the stake to the source coldkey.
         try:
@@ -1346,7 +1311,7 @@ class CollateralManager:
 
             except Exception as e:
                 # When the revert fails, raise a critical error.
-                raise CriticalError(f"Failed to revert the withdrawal from the contributor EVM contract: {e}") from e
+                raise CriticalError(f"Failed to revert the withdrawal from the EVM contract: {e}") from e
 
             # After reverting the withdrawal, raise an error for the stake transfer failure.
             raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
@@ -1364,7 +1329,7 @@ class CollateralManager:
         max_retries: int = 3,
     ) -> None:
         """
-        Force deposit the specified amount of alpha tokens into the contributor EVM contract without a stake transfer.
+        Force deposit the specified amount of alpha tokens into the EVM contract without a stake transfer.
         This function should be called on the owner validator side.
 
         Args:
@@ -1396,7 +1361,7 @@ class CollateralManager:
 
         for i in range(max_retries):
             try:
-                tx = self.contributor_contract.functions.depositFor(
+                tx = self.collateral_contract.functions.depositFor(
                     ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount
                 ).build_transaction(
                     {
@@ -1435,7 +1400,7 @@ class CollateralManager:
         max_retries: int = 3,
     ) -> None:
         """
-        Force withdraw the specified amount of alpha tokens from the contributor EVM contract without a stake transfer.
+        Force withdraw the specified amount of alpha tokens from the EVM contract without a stake transfer.
         This function should be called on the owner validator side.
 
         Args:
@@ -1467,7 +1432,7 @@ class CollateralManager:
 
         for i in range(max_retries):
             try:
-                tx = self.contributor_contract.functions.withdrawFor(
+                tx = self.collateral_contract.functions.withdrawFor(
                     ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount
                 ).build_transaction(
                     {
@@ -1506,7 +1471,7 @@ class CollateralManager:
         max_retries: int = 3,
     ) -> Balance:
         """
-        Slash the specified amount of alpha tokens from the contributor EVM contract.
+        Slash the specified amount of alpha tokens from the EVM contract.
         This function should be called on the owner validator side.
 
         Args:
@@ -1547,7 +1512,7 @@ class CollateralManager:
 
         for i in range(max_retries):
             try:
-                tx = self.contributor_contract.functions.slashFromContributor(
+                tx = self.collateral_contract.functions.slashFromContributor(
                     ss58_to_h160(miner_address), ss58_to_h160(contributor_address), amount.rao
                 ).build_transaction(
                     {
