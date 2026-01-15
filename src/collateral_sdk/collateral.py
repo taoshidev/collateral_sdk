@@ -192,7 +192,7 @@ class CollateralManager:
         """
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         if not is_valid_ss58_address(source_stake):
             raise ValueError(f"Invalid stake address: {source_stake}")
@@ -690,7 +690,7 @@ class CollateralManager:
             raise ValueError(f"Invalid SS58 address: {address}")
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
@@ -859,7 +859,7 @@ class CollateralManager:
         """
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         if not is_valid_ss58_address(source_coldkey):
             raise ValueError(f"Invalid destination SS58 address: {source_coldkey}")
