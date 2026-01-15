@@ -542,7 +542,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -606,7 +606,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -706,7 +706,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -890,7 +890,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
