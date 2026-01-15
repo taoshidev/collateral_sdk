@@ -4,7 +4,7 @@ import json
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 from async_substrate_interface.sync_substrate import ExtrinsicReceipt
 from bittensor.core.errors import ChainError
@@ -192,7 +192,7 @@ class CollateralManager:
         """
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         if not is_valid_ss58_address(source_stake):
             raise ValueError(f"Invalid stake address: {source_stake}")
@@ -321,8 +321,7 @@ class CollateralManager:
 
         if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
             raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', "
-                f"got '{module_name}.{function_name}'"
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{module_name}.{function_name}'"
             )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
@@ -542,7 +541,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -606,7 +605,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -690,7 +689,7 @@ class CollateralManager:
             raise ValueError(f"Invalid SS58 address: {address}")
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
@@ -706,7 +705,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -727,6 +726,93 @@ class CollateralManager:
                     continue
                 else:
                     raise EVMError(f"Failed to slash from the EVM contract: {e}") from e
+
+        return amount
+
+    def slash_with_burn(
+        self,
+        address: str,
+        amount: int,  # pyright: ignore[reportRedeclaration]
+        owner_address: str,
+        owner_private_key: str,
+        vault_stake: str,
+        vault_wallet: Wallet,
+        wallet_password: Optional[str] = None,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> Balance:
+        """
+        Slash the specified amount of alpha tokens from the EVM contract and burn them on Subtensor.
+        This function should be called on the owner validator side.
+
+        Args:
+            address (str): The SS58 address to slash from.
+            amount (int): The amount of alpha tokens to slash in Rao unit.
+            owner_address (str): The owner address the EVM contract.
+            owner_private_key (str): The private key of the owner.
+            vault_stake (str): The stake's SS58 address of the vault to burn the alpha tokens from.
+            vault_wallet (Wallet): The wallet of the vault.
+            wallet_password (Optional[str]): The password for the vault wallet.
+            max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
+            max_retries (int): The maximum number of attempts to retry. Defaults to 3.
+
+        Returns:
+            Balance: The amount of alpha tokens slashed and burned.
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
+
+        IMPORTANT:
+            This function performs two operations:
+            1. Slash from EVM contract
+            2. Burn alpha tokens on Subtensor
+            If the burn fails after a successful slash, the slashed tokens remain in the slashed collateral pool.
+        """
+
+        if not is_valid_ss58_address(address):
+            raise ValueError(f"Invalid SS58 address: {address}")
+
+        if not is_valid_ss58_address(vault_stake):
+            raise ValueError(f"Invalid vault stake SS58 address: {vault_stake}")
+
+        if amount <= 0:
+            raise ValueError(f"Amount must be greater than zero: {amount}")
+
+        amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
+
+        if amount > (balance := Balance.from_rao(self.balance_of(address), netuid=self.network.netuid)):
+            raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
+
+        evm_slash_tx_hash_hex: str = self._execute_evm_contract_function(
+            build_tx_fn=lambda contract: contract.functions.slash(ss58_to_h160(address), amount.rao),
+            owner_address=owner_address,
+            owner_private_key=owner_private_key,
+            error_message="Failed to slash from the EVM contract",
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+        )
+
+        try:
+            self._submit_extrinsic_with_retry(
+                create_extrinsic_fn=lambda: self.create_burn_alpha_extrinsic(
+                    amount=amount.rao,
+                    hotkey_ss58=vault_stake,
+                    vault_wallet=vault_wallet,
+                    wallet_password=wallet_password,
+                ),
+                error_message="Failed to burn alpha tokens on Subtensor",
+                max_backoff=max_backoff,
+                max_retries=max_retries,
+            )
+        except Exception as e:
+            # IMPORTANT: At this point, the EVM slash already succeeded (or very likely did).
+            # Do NOT let callers misinterpret this as "everything failed".
+            raise SubtensorError(
+                "burn failed AFTER evm slash succeeded; funds remain in slashedCollateral pool. "
+                f"evm_slash_tx_hash={evm_slash_tx_hash_hex}. burn_error={repr(e)}"
+            ) from e
 
         return amount
 
@@ -772,7 +858,7 @@ class CollateralManager:
         """
 
         if amount <= 0:
-            raise ValueError("Amount must be greater than zero: {amount}")
+            raise ValueError(f"Amount must be greater than zero: {amount}")
 
         if not is_valid_ss58_address(source_coldkey):
             raise ValueError(f"Invalid destination SS58 address: {source_coldkey}")
@@ -803,7 +889,7 @@ class CollateralManager:
                     {
                         "chainId": self.network.evm_chain_id,
                         "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address),  # pyright: ignore[reportArgumentType]
+                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
                     }
                 )
 
@@ -861,3 +947,161 @@ class CollateralManager:
             raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
 
         return amount
+
+    def create_burn_alpha_extrinsic(
+        self,
+        amount: int,
+        hotkey_ss58: str,
+        vault_wallet: Wallet,
+        wallet_password: Optional[str] = None,
+    ) -> GenericExtrinsic:
+        """
+        Create a burn_alpha extrinsic to permanently burn alpha stake on Subtensor.
+
+        NOTE:
+        - This function ONLY creates and signs the extrinsic.
+        - The caller is responsible for submitting it via submit_extrinsic().
+
+        Args:
+            amount (int): The amount of alpha tokens to burn in Rao unit.
+            hotkey_ss58 (str): Hotkey SS58 address whose stake will be burned
+            vault_wallet (Wallet): Vault wallet (coldkey signs the burn)
+            wallet_password (Optional[str]): Password if the wallet is encrypted
+
+        Returns:
+            GenericExtrinsic: Signed burn_alpha extrinsic
+        """
+
+        if amount <= 0:
+            raise ValueError(f"Amount must be greater than zero: {amount}")
+
+        if not is_valid_ss58_address(hotkey_ss58):
+            raise ValueError(f"Invalid hotkey SS58 address: {hotkey_ss58}")
+
+        amount_balance: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
+
+        staked_amount: Balance = self.subtensor_api.staking.get_stake(
+            coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+            hotkey_ss58=hotkey_ss58,
+            netuid=self.network.netuid,
+        )
+
+        if amount_balance > staked_amount:
+            raise ValueError(f"Insufficient stake: {staked_amount}, requested: {amount_balance}")
+
+        call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+            call_module="SubtensorModule",
+            call_function="burn_alpha",
+            call_params={
+                "netuid": self.network.netuid,
+                "hotkey": hotkey_ss58,
+                "amount": amount,
+            },
+        )
+
+        extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
+            call=call,
+            keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
+        )
+
+        return extrinsic
+
+    def _submit_extrinsic_with_retry(
+        self,
+        create_extrinsic_fn: Callable[[], GenericExtrinsic],
+        error_message: str,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> ExtrinsicReceipt:
+        """
+        Submit an extrinsic with retry logic using exponential backoff.
+
+        Args:
+            create_extrinsic_fn: A callable that creates and returns a GenericExtrinsic.
+            error_message: Error message to use when all retries are exhausted.
+            max_backoff: Maximum backoff time in seconds. Defaults to 30.0.
+            max_retries: Maximum number of retry attempts. Defaults to 3.
+
+        Returns:
+            ExtrinsicReceipt: The result of the successful extrinsic submission.
+
+        Raises:
+            SubtensorError: If all retry attempts fail.
+        """
+        for i in range(max_retries):
+            try:
+                extrinsic: GenericExtrinsic = create_extrinsic_fn()
+                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                    extrinsic,
+                    wait_for_inclusion=True,
+                )
+
+                if not result.is_success:
+                    raise ChainError.from_error(result.error_message)
+
+                return result
+
+            except Exception as e:
+                if i < max_retries - 1:
+                    time.sleep(min(2**i, max_backoff))
+                    continue
+                else:
+                    raise SubtensorError(f"{error_message}: {e}") from e
+
+    def _execute_evm_contract_function(
+        self,
+        build_tx_fn: Callable[[Any], Any],
+        owner_address: str,
+        owner_private_key: str,
+        error_message: str,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> str:
+        """
+        Execute an EVM contract function with retry logic using exponential backoff.
+
+        Args:
+            build_tx_fn: A callable that takes a contract instance and returns a transaction builder.
+                         Example: lambda contract: contract.functions.slash(address, amount)
+            owner_address: The owner address for the EVM contract.
+            owner_private_key: The private key of the owner.
+            error_message: Error message to use when all retries are exhausted.
+            max_backoff: Maximum backoff time in seconds. Defaults to 30.0.
+            max_retries: Maximum number of retry attempts. Defaults to 3.
+
+        Returns:
+            str: Transaction hash in hex format.
+
+        Raises:
+            EVMError: If all retry attempts fail.
+        """
+        for i in range(max_retries):
+            try:
+                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+                nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]
+
+                tx = build_tx_fn(contract).build_transaction(
+                    {
+                        "chainId": self.network.evm_chain_id,
+                        "from": owner_address,
+                        "nonce": nonce,
+                    }
+                )
+
+                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+
+                if receipt["status"] == 1:
+                    return tx_hash.hex()
+                else:
+                    raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
+
+            except Exception as e:
+                if i < max_retries - 1:
+                    time.sleep(min(2**i, max_backoff))
+                    continue
+                else:
+                    raise EVMError(f"{error_message}: {e}") from e
