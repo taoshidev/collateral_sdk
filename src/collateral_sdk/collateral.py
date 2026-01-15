@@ -961,3 +961,61 @@ class CollateralManager:
                     continue
                 else:
                     raise SubtensorError(f"{error_message}: {e}") from e
+
+    def _execute_evm_contract_function(
+        self,
+        build_tx_fn: Callable[[Any], Any],
+        owner_address: str,
+        owner_private_key: str,
+        error_message: str,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> str:
+        """
+        Execute an EVM contract function with retry logic using exponential backoff.
+
+        Args:
+            build_tx_fn: A callable that takes a contract instance and returns a transaction builder.
+                         Example: lambda contract: contract.functions.slash(address, amount)
+            owner_address: The owner address for the EVM contract.
+            owner_private_key: The private key of the owner.
+            error_message: Error message to use when all retries are exhausted.
+            max_backoff: Maximum backoff time in seconds. Defaults to 30.0.
+            max_retries: Maximum number of retry attempts. Defaults to 3.
+
+        Returns:
+            str: Transaction hash in hex format.
+
+        Raises:
+            EVMError: If all retry attempts fail.
+        """
+        for i in range(max_retries):
+            try:
+                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+                nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]
+
+                tx = build_tx_fn(contract).build_transaction(
+                    {
+                        "chainId": self.network.evm_chain_id,
+                        "from": owner_address,
+                        "nonce": nonce,
+                    }
+                )
+
+                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+
+                if receipt["status"] == 1:
+                    return tx_hash.hex()
+                else:
+                    raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
+
+            except Exception as e:
+                if i < max_retries - 1:
+                    time.sleep(min(2 ** i, max_backoff))
+                    continue
+                else:
+                    raise EVMError(f"{error_message}: {e}") from e
