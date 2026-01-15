@@ -4,7 +4,7 @@ import json
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 from async_substrate_interface.sync_substrate import ExtrinsicReceipt
 from bittensor.core.errors import ChainError
@@ -919,3 +919,45 @@ class CollateralManager:
         )
 
         return extrinsic
+
+    def _submit_extrinsic_with_retry(
+        self,
+        create_extrinsic_fn: Callable[[], GenericExtrinsic],
+        error_message: str,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> ExtrinsicReceipt:
+        """
+        Submit an extrinsic with retry logic using exponential backoff.
+
+        Args:
+            create_extrinsic_fn: A callable that creates and returns a GenericExtrinsic.
+            error_message: Error message to use when all retries are exhausted.
+            max_backoff: Maximum backoff time in seconds. Defaults to 30.0.
+            max_retries: Maximum number of retry attempts. Defaults to 3.
+
+        Returns:
+            ExtrinsicReceipt: The result of the successful extrinsic submission.
+
+        Raises:
+            SubtensorError: If all retry attempts fail.
+        """
+        for i in range(max_retries):
+            try:
+                extrinsic: GenericExtrinsic = create_extrinsic_fn()
+                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                    extrinsic,
+                    wait_for_inclusion=True,
+                )
+
+                if not result.is_success:
+                    raise ChainError.from_error(result.error_message)
+
+                return result
+
+            except Exception as e:
+                if i < max_retries - 1:
+                    time.sleep(min(2 ** i, max_backoff))
+                    continue
+                else:
+                    raise SubtensorError(f"{error_message}: {e}") from e
