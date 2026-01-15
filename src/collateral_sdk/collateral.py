@@ -861,3 +861,61 @@ class CollateralManager:
             raise SubtensorError(f"Failed to transfer the stake to the destination wallet: {e}") from e
 
         return amount
+
+    def create_burn_alpha_extrinsic(
+        self,
+        amount: int,
+        hotkey_ss58: str,
+        vault_wallet: Wallet,
+        wallet_password: Optional[str] = None,
+    ) -> GenericExtrinsic:
+        """
+        Create a burn_alpha extrinsic to permanently burn alpha stake on Subtensor.
+
+        NOTE:
+        - This function ONLY creates and signs the extrinsic.
+        - The caller is responsible for submitting it via submit_extrinsic().
+
+        Args:
+            amount (int): The amount of alpha tokens to burn in Rao unit.
+            hotkey_ss58 (str): Hotkey SS58 address whose stake will be burned
+            vault_wallet (Wallet): Vault wallet (coldkey signs the burn)
+            wallet_password (Optional[str]): Password if the wallet is encrypted
+
+        Returns:
+            GenericExtrinsic: Signed burn_alpha extrinsic
+        """
+
+        if amount <= 0:
+            raise ValueError(f"Amount must be greater than zero: {amount}")
+
+        if not is_valid_ss58_address(hotkey_ss58):
+            raise ValueError(f"Invalid hotkey SS58 address: {hotkey_ss58}")
+
+        amount_balance: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
+
+        staked_amount: Balance = self.subtensor_api.staking.get_stake(
+            coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+            hotkey_ss58=hotkey_ss58,
+            netuid=self.network.netuid,
+        )
+
+        if amount_balance > staked_amount:
+            raise ValueError(f"Insufficient stake: {staked_amount}, requested: {amount_balance}")
+
+        call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+            call_module="SubtensorModule",
+            call_function="burn_alpha",
+            call_params={
+                "netuid": self.network.netuid,
+                "hotkey": hotkey_ss58,
+                "amount": amount,
+            },
+        )
+
+        extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
+            call=call,
+            keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
+        )
+
+        return extrinsic
