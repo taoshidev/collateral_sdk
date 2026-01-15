@@ -321,8 +321,7 @@ class CollateralManager:
 
         if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
             raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', "
-                f"got '{module_name}.{function_name}'"
+                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{module_name}.{function_name}'"
             )
 
         if isinstance(call_args := extrinsic["call"]["call_args"], dict):
@@ -1044,7 +1043,7 @@ class CollateralManager:
 
             except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(min(2 ** i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise SubtensorError(f"{error_message}: {e}") from e
@@ -1102,7 +1101,7 @@ class CollateralManager:
 
             except Exception as e:
                 if i < max_retries - 1:
-                    time.sleep(min(2 ** i, max_backoff))
+                    time.sleep(min(2**i, max_backoff))
                     continue
                 else:
                     raise EVMError(f"{error_message}: {e}") from e
