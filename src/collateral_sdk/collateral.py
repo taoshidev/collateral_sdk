@@ -8,12 +8,13 @@ from typing import Any, Optional, Callable
 
 from async_substrate_interface.sync_substrate import ExtrinsicReceipt
 from bittensor.core.errors import ChainError
-from bittensor.core.subtensor_api import SubtensorApi
+from bittensor.extras.subtensor_api import SubtensorApi
 from bittensor.utils import is_valid_ss58_address
 from bittensor.utils.balance import Balance
 from bittensor_wallet import Wallet
-from scalecodec import ss58_encode
-from scalecodec.types import GenericCall, GenericExtrinsic, ScaleBytes
+from scalecodec.utils.ss58 import ss58_encode
+from scalecodec.types import GenericCall, GenericExtrinsic
+from scalecodec import ScaleBytes
 from web3 import Web3
 
 from . import abi
@@ -217,7 +218,7 @@ class CollateralManager:
         if amount > staked_amount:
             raise ValueError(f"Insufficient balance: {staked_amount}, requested: {amount}")
 
-        call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+        call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
             call_module="SubtensorModule",
             call_function="transfer_stake",
             call_params={
@@ -229,7 +230,7 @@ class CollateralManager:
             },
         )
 
-        extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
+        extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
             call=call,
             keypair=source_wallet.get_coldkey(wallet_password) if wallet_password else source_wallet.coldkey,
         )
@@ -363,7 +364,7 @@ class CollateralManager:
         try:
             # Default RPC retries is 5 and RPC timeout is 60 seconds, which are configured in SubstrateInterface's __init__().
             # No need to retry login here.
-            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+            result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                 extrinsic,
                 wait_for_inclusion=True,
             )
@@ -384,7 +385,7 @@ class CollateralManager:
         # 2. Move the stake to the vault's stake address.
         if origin_hotkey != vault_stake:
             try:
-                move_call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+                move_call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
                     call_module="SubtensorModule",
                     call_function="move_stake",
                     call_params={
@@ -396,12 +397,12 @@ class CollateralManager:
                     },
                 )
 
-                move_extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
+                move_extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
                     call=move_call,
                     keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
                 )
 
-                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                     move_extrinsic,
                     wait_for_inclusion=True,
                 )
@@ -427,7 +428,7 @@ class CollateralManager:
                         wallet_password=wallet_password,
                     )
 
-                    result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                    result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                         revert_extrinsic,
                         wait_for_inclusion=True,
                     )
@@ -482,7 +483,7 @@ class CollateralManager:
                             wallet_password=wallet_password,
                         )
 
-                        result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                        result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                             revert_extrinsic,
                             wait_for_inclusion=True,
                         )
@@ -921,7 +922,7 @@ class CollateralManager:
                 wallet_password=wallet_password,
             )
 
-            result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+            result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                 transfer_extrinsic,
                 wait_for_inclusion=True,
             )
@@ -989,7 +990,7 @@ class CollateralManager:
         if amount_balance > staked_amount:
             raise ValueError(f"Insufficient stake: {staked_amount}, requested: {amount_balance}")
 
-        call: GenericCall = self.subtensor_api._subtensor.substrate.compose_call(
+        call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
             call_module="SubtensorModule",
             call_function="burn_alpha",
             call_params={
@@ -999,7 +1000,7 @@ class CollateralManager:
             },
         )
 
-        extrinsic: GenericExtrinsic = self.subtensor_api._subtensor.substrate.create_signed_extrinsic(
+        extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
             call=call,
             keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
         )
@@ -1012,7 +1013,7 @@ class CollateralManager:
         error_message: str,
         max_backoff: float = 30.0,
         max_retries: int = 3,
-    ) -> ExtrinsicReceipt:
+    ) -> ExtrinsicReceipt | None:
         """
         Submit an extrinsic with retry logic using exponential backoff.
 
@@ -1031,7 +1032,7 @@ class CollateralManager:
         for i in range(max_retries):
             try:
                 extrinsic: GenericExtrinsic = create_extrinsic_fn()
-                result: ExtrinsicReceipt = self.subtensor_api._subtensor.substrate.submit_extrinsic(
+                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                     extrinsic,
                     wait_for_inclusion=True,
                 )
