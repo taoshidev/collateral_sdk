@@ -697,36 +697,66 @@ class CollateralManager:
         if amount > (balance := Balance.from_rao(self.balance_of(address), netuid=self.network.netuid)):
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
-        for i in range(max_retries):
-            try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+        self._execute_evm_contract_function(
+            build_tx_fn=lambda contract: contract.functions.slash(ss58_to_h160(address), amount.rao),
+            owner_address=owner_address,
+            owner_private_key=owner_private_key,
+            error_message="Failed to slash from the EVM contract",
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+        )
 
-                tx = contract.functions.slash(ss58_to_h160(address), amount.rao).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
+        return amount
 
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+    def burn(
+        self,
+        amount: int,  # pyright: ignore[reportRedeclaration]
+        vault_stake: str,
+        vault_wallet: Wallet,
+        wallet_password: Optional[str] = None,
+        max_backoff: float = 30.0,
+        max_retries: int = 3,
+    ) -> Balance:
+        """
+        Burn the specified amount of alpha tokens on Subtensor from the vault's stake.
+        This function should be called on the owner validator side.
 
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
+        Args:
+            amount (int): The amount of alpha tokens to burn in Rao unit.
+            vault_stake (str): The stake's SS58 address of the vault to burn the alpha tokens from.
+            vault_wallet (Wallet): The wallet of the vault.
+            wallet_password (Optional[str]): The password for the vault wallet.
+            max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
+            max_retries (int): The maximum number of attempts to retry. Defaults to 3.
 
-            except Exception as e:
-                if i < max_retries - 1:
-                    time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"Failed to slash from the EVM contract: {e}") from e
+        Returns:
+            Balance: The amount of alpha tokens burned.
+
+        CAUTION:
+            This method is assumed to be called from a trusted node such as a owner/super validator.
+            The owner/super validator should store the private key in a secure location, load and pass it to this method.
+            NEVER, NEVER expose the private key to the public!
+        """
+
+        if not is_valid_ss58_address(vault_stake):
+            raise ValueError(f"Invalid vault stake SS58 address: {vault_stake}")
+
+        if amount <= 0:
+            raise ValueError(f"Amount must be greater than zero: {amount}")
+
+        amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
+
+        self._submit_extrinsic_with_retry(
+            create_extrinsic_fn=lambda: self.create_burn_alpha_extrinsic(
+                amount=amount.rao,
+                hotkey_ss58=vault_stake,
+                vault_wallet=vault_wallet,
+                wallet_password=wallet_password,
+            ),
+            error_message="Failed to burn alpha tokens on Subtensor",
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+        )
 
         return amount
 
@@ -772,50 +802,33 @@ class CollateralManager:
             If the burn fails after a successful slash, the slashed tokens remain in the slashed collateral pool.
         """
 
-        if not is_valid_ss58_address(address):
-            raise ValueError(f"Invalid SS58 address: {address}")
-
-        if not is_valid_ss58_address(vault_stake):
-            raise ValueError(f"Invalid vault stake SS58 address: {vault_stake}")
-
-        if amount <= 0:
-            raise ValueError(f"Amount must be greater than zero: {amount}")
-
-        amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
-
-        if amount > (balance := Balance.from_rao(self.balance_of(address), netuid=self.network.netuid)):
-            raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
-
-        evm_slash_tx_hash_hex: str = self._execute_evm_contract_function(
-            build_tx_fn=lambda contract: contract.functions.slash(ss58_to_h160(address), amount.rao),
+        slashed = self.slash(
+            address=address,
+            amount=amount,
             owner_address=owner_address,
             owner_private_key=owner_private_key,
-            error_message="Failed to slash from the EVM contract",
             max_backoff=max_backoff,
             max_retries=max_retries,
         )
 
         try:
-            self._submit_extrinsic_with_retry(
-                create_extrinsic_fn=lambda: self.create_burn_alpha_extrinsic(
-                    amount=amount.rao,
-                    hotkey_ss58=vault_stake,
-                    vault_wallet=vault_wallet,
-                    wallet_password=wallet_password,
-                ),
-                error_message="Failed to burn alpha tokens on Subtensor",
+            self.burn(
+                amount=slashed.rao,
+                vault_stake=vault_stake,
+                vault_wallet=vault_wallet,
+                wallet_password=wallet_password,
                 max_backoff=max_backoff,
                 max_retries=max_retries,
             )
         except Exception as e:
-            # IMPORTANT: At this point, the EVM slash already succeeded (or very likely did).
+            # IMPORTANT: At this point, the EVM slash already succeeded.
             # Do NOT let callers misinterpret this as "everything failed".
             raise SubtensorError(
                 "burn failed AFTER evm slash succeeded; funds remain in slashedCollateral pool. "
-                f"evm_slash_tx_hash={evm_slash_tx_hash_hex}. burn_error={repr(e)}"
+                f"burn_error={repr(e)}"
             ) from e
 
-        return amount
+        return slashed
 
     def withdraw(
         self,
