@@ -894,36 +894,51 @@ class CollateralManager:
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
         # 1. Withdraw the collateral from the EVM contract.
+        # Sign once with a fixed nonce so every retry rebroadcasts the identical
+        # transaction. The chain's nonce uniqueness then guarantees at most one
+        # withdrawal can ever be mined for this call, no matter how many times a
+        # transient RPC failure (e.g. rate limiting while polling for the receipt)
+        # forces us to retry -- earlier code built a brand-new transaction on every
+        # retry, which could submit and mine more than one real withdrawal.
+        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+        tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
+            {
+                "chainId": self.network.evm_chain_id,
+                "from": owner_address,
+                "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
+            }
+        )
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+        tx_hash = signed_tx.hash
+
+        receipt = None
+        last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-                tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
-
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                web3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
-
+                break
             except Exception as e:
+                last_error = e
                 if i < max_retries - 1:
                     time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"Failed to withdraw from the EVM contract: {e}") from e
+
+        if receipt is None:
+            # Polling for the receipt never succeeded -- before concluding the
+            # withdrawal failed, check once more directly, since the transaction
+            # may have actually been mined despite RPC errors during confirmation.
+            try:
+                receipt = web3.eth.get_transaction_receipt(tx_hash)
+            except Exception:
+                receipt = None
+
+        if receipt is None:
+            raise EVMError(f"Failed to withdraw from the EVM contract: {last_error}") from last_error
+
+        if receipt["status"] != 1:
+            raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
 
         # 2. Transfer the stake to the source coldkey.
         try:
