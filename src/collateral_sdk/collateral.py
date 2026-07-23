@@ -420,8 +420,17 @@ class CollateralManager:
             except Exception as e:
                 # 3. Revert the stake transfer if the stake move fails.
                 try:
+                    # The recorded amount can slightly exceed what's actually available to
+                    # move back (stake movement fees, or concurrent activity on the shared
+                    # vault coldkey) -- revert whatever is currently available rather than
+                    # letting the revert itself fail outright over a small shortfall.
+                    current_stake = self.subtensor_api.staking.get_stake(
+                        coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+                        hotkey_ss58=origin_hotkey,
+                        netuid=self.network.netuid,
+                    )
                     revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                        amount=stake_added.rao,
+                        amount=min(stake_added.rao, current_stake.rao),
                         source_stake=origin_hotkey,
                         source_wallet=vault_wallet,
                         dest=origin_coldkey,
@@ -485,8 +494,15 @@ class CollateralManager:
         if receipt is None or receipt["status"] != 1:
             # 4. Revert the stake transfer if deposit in the EVM fails.
             try:
+                # Same rationale as the step 3 revert above: don't let a small shortfall
+                # in what's currently available block the whole revert.
+                current_stake = self.subtensor_api.staking.get_stake(
+                    coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=vault_stake,
+                    netuid=self.network.netuid,
+                )
                 revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                    amount=stake_added.rao,
+                    amount=min(stake_added.rao, current_stake.rao),
                     source_stake=vault_stake,
                     source_wallet=vault_wallet,
                     dest=origin_coldkey,
