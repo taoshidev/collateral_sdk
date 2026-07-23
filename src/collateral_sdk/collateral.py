@@ -21,6 +21,10 @@ from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
 from .utils import ss58_to_h160
 
+# Default tolerance for reverting less stake than was originally moved, to account for
+# the on-chain transfer_stake fee.
+DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO = 50_000_000  # 0.05 alpha/tao
+
 
 class Network(Enum):
     """
@@ -420,8 +424,25 @@ class CollateralManager:
             except Exception as e:
                 # 3. Revert the stake transfer if the stake move fails.
                 try:
+                    # The recorded amount can slightly exceed what's actually available to move
+                    # back (mainly the transfer_stake fee) -- revert whatever is currently
+                    # available rather than letting the revert itself fail outright over a small
+                    # shortfall. A shortfall beyond the tolerance is treated as a real problem
+                    # (e.g. concurrent activity on the shared vault coldkey), not silently eaten.
+                    current_stake = self.subtensor_api.staking.get_stake(
+                        coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+                        hotkey_ss58=origin_hotkey,
+                        netuid=self.network.netuid,
+                    )
+                    shortfall = stake_added.rao - current_stake.rao
+                    if shortfall > DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO:
+                        raise CriticalError(
+                            f"Only {current_stake.rao} rao available to revert, "
+                            f"{shortfall} rao short of the {stake_added.rao} rao expected "
+                            f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
+                        )
                     revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                        amount=stake_added.rao,
+                        amount=min(stake_added.rao, current_stake.rao),
                         source_stake=origin_hotkey,
                         source_wallet=vault_wallet,
                         dest=origin_coldkey,
@@ -436,6 +457,8 @@ class CollateralManager:
                     if not result.is_success:
                         raise ChainError.from_error(result.error_message)
 
+                except CriticalError:
+                    raise
                 except Exception as e:
                     # When the revert fails, raise a critical error.
                     raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
@@ -444,59 +467,86 @@ class CollateralManager:
                 raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
 
         # 4. Deposit the collateral into the EVM contract.
+        # Sign once with a fixed nonce so every retry rebroadcasts the identical
+        # transaction -- the chain's nonce uniqueness then guarantees at most one
+        # deposit can ever be mined for this call, no matter how many times a
+        # transient RPC failure forces us to retry.
+        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+        tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
+            {
+                "chainId": self.network.evm_chain_id,
+                "from": owner_address,
+                "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
+            }
+        )
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+        tx_hash = signed_tx.hash
+
+        receipt = None
+        last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-                tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
-
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                web3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
-
+                break
             except Exception as e:
+                last_error = e
                 if i < max_retries - 1:
                     time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    # 4. Revert the stake transfer if deposit in the EVM fails.
-                    try:
-                        revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
-                            amount=stake_added.rao,
-                            source_stake=vault_stake,
-                            source_wallet=vault_wallet,
-                            dest=origin_coldkey,
-                            wallet_password=wallet_password,
-                        )
 
-                        result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                            revert_extrinsic,
-                            wait_for_inclusion=True,
-                        )
+        if receipt is None:
+            # Polling for the receipt never succeeded -- before concluding the
+            # deposit failed, check once more directly, since the transaction
+            # may have actually been mined despite RPC errors during confirmation.
+            try:
+                receipt = web3.eth.get_transaction_receipt(tx_hash)
+            except Exception:
+                receipt = None
 
-                        if not result.is_success:
-                            raise ChainError.from_error(result.error_message)
+        if receipt is None or receipt["status"] != 1:
+            # 4. Revert the stake transfer if deposit in the EVM fails.
+            try:
+                # Same rationale as the step 3 revert above: don't let a small shortfall
+                # (mainly the transfer_stake fee) block the whole revert, but treat a
+                # shortfall beyond tolerance as a real problem, not something to silently eat.
+                current_stake = self.subtensor_api.staking.get_stake(
+                    coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
+                    hotkey_ss58=vault_stake,
+                    netuid=self.network.netuid,
+                )
+                shortfall = stake_added.rao - current_stake.rao
+                if shortfall > DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO:
+                    raise CriticalError(
+                        f"Only {current_stake.rao} rao available to revert, "
+                        f"{shortfall} rao short of the {stake_added.rao} rao expected "
+                        f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
+                    )
+                revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                    amount=min(stake_added.rao, current_stake.rao),
+                    source_stake=vault_stake,
+                    source_wallet=vault_wallet,
+                    dest=origin_coldkey,
+                    wallet_password=wallet_password,
+                )
 
-                    except Exception as e:
-                        # When the revert fails, raise a critical error.
-                        raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
+                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
+                    revert_extrinsic,
+                    wait_for_inclusion=True,
+                )
 
-                    # After reverting the stake transfer, raise an error for the deposit failure.
-                    raise EVMError(f"Failed to deposit into the EVM contract: {e}") from e
+                if not result.is_success:
+                    raise ChainError.from_error(result.error_message)
+
+            except CriticalError:
+                raise
+            except Exception as e:
+                # When the revert fails, raise a critical error.
+                raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
+
+            # After reverting the stake transfer, raise an error for the deposit failure.
+            raise EVMError(f"Failed to deposit into the EVM contract: {last_error}") from last_error
 
         return stake_added
 
@@ -894,36 +944,51 @@ class CollateralManager:
             raise ValueError(f"Insufficient balance: {balance}, requested: {amount}")
 
         # 1. Withdraw the collateral from the EVM contract.
+        # Sign once with a fixed nonce so every retry rebroadcasts the identical
+        # transaction. The chain's nonce uniqueness then guarantees at most one
+        # withdrawal can ever be mined for this call, no matter how many times a
+        # transient RPC failure (e.g. rate limiting while polling for the receipt)
+        # forces us to retry -- earlier code built a brand-new transaction on every
+        # retry, which could submit and mine more than one real withdrawal.
+        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+
+        tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
+            {
+                "chainId": self.network.evm_chain_id,
+                "from": owner_address,
+                "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
+            }
+        )
+        signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
+        tx_hash = signed_tx.hash
+
+        receipt = None
+        last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-                tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
-
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                web3.eth.send_raw_transaction(signed_tx.raw_transaction)
                 receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
-
+                break
             except Exception as e:
+                last_error = e
                 if i < max_retries - 1:
                     time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"Failed to withdraw from the EVM contract: {e}") from e
+
+        if receipt is None:
+            # Polling for the receipt never succeeded -- before concluding the
+            # withdrawal failed, check once more directly, since the transaction
+            # may have actually been mined despite RPC errors during confirmation.
+            try:
+                receipt = web3.eth.get_transaction_receipt(tx_hash)
+            except Exception:
+                receipt = None
+
+        if receipt is None:
+            raise EVMError(f"Failed to withdraw from the EVM contract: {last_error}") from last_error
+
+        if receipt["status"] != 1:
+            raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
 
         # 2. Transfer the stake to the source coldkey.
         try:
