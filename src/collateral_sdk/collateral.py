@@ -21,6 +21,10 @@ from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
 from .utils import ss58_to_h160
 
+# Default tolerance for reverting less stake than was originally moved, to account for
+# the on-chain transfer_stake fee.
+DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO = 50_000_000  # 0.05 alpha/tao
+
 
 class Network(Enum):
     """
@@ -420,15 +424,23 @@ class CollateralManager:
             except Exception as e:
                 # 3. Revert the stake transfer if the stake move fails.
                 try:
-                    # The recorded amount can slightly exceed what's actually available to
-                    # move back (stake movement fees, or concurrent activity on the shared
-                    # vault coldkey) -- revert whatever is currently available rather than
-                    # letting the revert itself fail outright over a small shortfall.
+                    # The recorded amount can slightly exceed what's actually available to move
+                    # back (mainly the transfer_stake fee) -- revert whatever is currently
+                    # available rather than letting the revert itself fail outright over a small
+                    # shortfall. A shortfall beyond the tolerance is treated as a real problem
+                    # (e.g. concurrent activity on the shared vault coldkey), not silently eaten.
                     current_stake = self.subtensor_api.staking.get_stake(
                         coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
                         hotkey_ss58=origin_hotkey,
                         netuid=self.network.netuid,
                     )
+                    shortfall = stake_added.rao - current_stake.rao
+                    if shortfall > DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO:
+                        raise CriticalError(
+                            f"Only {current_stake.rao} rao available to revert, "
+                            f"{shortfall} rao short of the {stake_added.rao} rao expected "
+                            f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
+                        )
                     revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
                         amount=min(stake_added.rao, current_stake.rao),
                         source_stake=origin_hotkey,
@@ -445,6 +457,8 @@ class CollateralManager:
                     if not result.is_success:
                         raise ChainError.from_error(result.error_message)
 
+                except CriticalError:
+                    raise
                 except Exception as e:
                     # When the revert fails, raise a critical error.
                     raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
@@ -495,12 +509,20 @@ class CollateralManager:
             # 4. Revert the stake transfer if deposit in the EVM fails.
             try:
                 # Same rationale as the step 3 revert above: don't let a small shortfall
-                # in what's currently available block the whole revert.
+                # (mainly the transfer_stake fee) block the whole revert, but treat a
+                # shortfall beyond tolerance as a real problem, not something to silently eat.
                 current_stake = self.subtensor_api.staking.get_stake(
                     coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
                     hotkey_ss58=vault_stake,
                     netuid=self.network.netuid,
                 )
+                shortfall = stake_added.rao - current_stake.rao
+                if shortfall > DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO:
+                    raise CriticalError(
+                        f"Only {current_stake.rao} rao available to revert, "
+                        f"{shortfall} rao short of the {stake_added.rao} rao expected "
+                        f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
+                    )
                 revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
                     amount=min(stake_added.rao, current_stake.rao),
                     source_stake=vault_stake,
@@ -517,6 +539,8 @@ class CollateralManager:
                 if not result.is_success:
                     raise ChainError.from_error(result.error_message)
 
+            except CriticalError:
+                raise
             except Exception as e:
                 # When the revert fails, raise a critical error.
                 raise CriticalError(f"Failed to revert the stake transfer: {e}") from e
