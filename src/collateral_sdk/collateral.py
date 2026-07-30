@@ -2,19 +2,17 @@
 
 import json
 import time
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Optional, Callable
 
-from async_substrate_interface.sync_substrate import ExtrinsicReceipt
-from bittensor.core.errors import ChainError
-from bittensor.extras.subtensor_api import SubtensorApi
-from bittensor.utils import is_valid_ss58_address
-from bittensor.utils.balance import Balance
-from bittensor_wallet import Wallet
-from scalecodec.utils.ss58 import ss58_encode
-from scalecodec.types import GenericCall, GenericExtrinsic
-from scalecodec import ScaleBytes
+import bittensor as bt
+from bittensor import ChainError, UnsignedExtrinsic
+from bittensor.balance import Balance
+from bittensor.result import ExtrinsicResult
+from bittensor.wallet import Wallet
+from bittensor.wallets import is_valid_ss58_address
 from web3 import Web3
 
 from . import abi
@@ -91,6 +89,49 @@ class Network(Enum):
             raise ValueError(f"Unknown network: {self}")
 
 
+@dataclass
+class SignedTransferPayload:
+    """A signed transfer_stake extrinsic for the two-phase sign-then-submit pattern.
+
+    The miner creates and signs this on the source side; the vault validates
+    the parameters and submits it on the destination side.
+    """
+
+    unsigned: UnsignedExtrinsic
+    signature: bytes
+    origin_coldkey: str
+    origin_hotkey: str
+    origin_netuid: int
+    destination_coldkey: str
+    destination_netuid: int
+    alpha_amount: int  # in rao
+
+    def to_dict(self) -> dict:
+        return {
+            "unsigned": self.unsigned.to_dict(),
+            "signature": "0x" + self.signature.hex(),
+            "origin_coldkey": self.origin_coldkey,
+            "origin_hotkey": self.origin_hotkey,
+            "origin_netuid": self.origin_netuid,
+            "destination_coldkey": self.destination_coldkey,
+            "destination_netuid": self.destination_netuid,
+            "alpha_amount": self.alpha_amount,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SignedTransferPayload":
+        return cls(
+            unsigned=UnsignedExtrinsic.from_dict(data["unsigned"]),
+            signature=bytes.fromhex(data["signature"].removeprefix("0x")),
+            origin_coldkey=data["origin_coldkey"],
+            origin_hotkey=data["origin_hotkey"],
+            origin_netuid=data["origin_netuid"],
+            destination_coldkey=data["destination_coldkey"],
+            destination_netuid=data["destination_netuid"],
+            alpha_amount=data["alpha_amount"],
+        )
+
+
 class CollateralManager:
     """
     A class to manage collateral operations on the PTN network.
@@ -120,13 +161,13 @@ class CollateralManager:
 
         self.network = network
         self.program_address = program_address or network.evm_program_address
-        self._subtensor_api = None
+        self._subtensor: Optional[bt.Subtensor] = None
 
     @property
-    def subtensor_api(self):
-        if self._subtensor_api is None:
-            self._subtensor_api = SubtensorApi(network=self.network.subtensor_network)
-        return self._subtensor_api
+    def subtensor(self) -> bt.Subtensor:
+        if self._subtensor is None:
+            self._subtensor = bt.Subtensor(network=self.network.subtensor_network)
+        return self._subtensor
 
     def _get_stake_added_amount(self, events: list[dict]) -> Balance:
         """
@@ -179,21 +220,21 @@ class CollateralManager:
         source_netuid: Optional[int] = None,
         dest_netuid: Optional[int] = None,
         wallet_password: Optional[str] = None,
-    ) -> GenericExtrinsic:
+    ) -> SignedTransferPayload:
         """
-        Create a stake transfer extrinsic for the specified amount and destination.
+        Create a signed stake transfer payload for the specified amount and destination.
 
         Args:
             amount (int): The amount of alpha tokens to transfer in Rao unit.
             dest (str): The destination SS58 address to transfer the stake to.
             source_stake (str): The source stake's SS58 address to transfer.
-            source wallet (Wallet): The source wallet to transfer the stake from.
+            source_wallet (Wallet): The source wallet to transfer the stake from.
             source_netuid (Optional[int]): The source netuid for the transfer. Defaults to 8 for Network.MAINET and 116 for Network.TESTNET.
             dest_netuid (Optional[int]): The destination netuid for the transfer. Defaults to 8 for Network.MAINET and 116 for Network.TESTNET.
             wallet_password (Optional[str]): The password for the source wallet.
 
         Returns:
-            extrinsic: The signed extrinsic for the stake transfser.
+            SignedTransferPayload: The signed payload for the stake transfer.
         """
 
         if amount <= 0:
@@ -211,72 +252,73 @@ class CollateralManager:
         if dest_netuid is None:
             dest_netuid = self.network.netuid
 
-        amount: Balance = Balance.from_rao(amount, netuid=source_netuid)
+        amount_balance: Balance = Balance.from_rao(amount, netuid=source_netuid)
 
-        staked_amount: Balance = self.subtensor_api.staking.get_stake(
+        staked_amount: Balance = self.subtensor.staking.stake(
             coldkey_ss58=source_wallet.coldkeypub.ss58_address,
             hotkey_ss58=source_stake,
             netuid=source_netuid,
         )
 
-        if amount > staked_amount:
-            raise ValueError(f"Insufficient balance: {staked_amount}, requested: {amount}")
+        if amount_balance > staked_amount:
+            raise ValueError(f"Insufficient balance: {staked_amount}, requested: {amount_balance}")
 
-        call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
-            call_module="SubtensorModule",
-            call_function="transfer_stake",
-            call_params={
-                "destination_coldkey": dest,
-                "hotkey": source_stake,
-                "origin_netuid": source_netuid,
-                "destination_netuid": dest_netuid,
-                "alpha_amount": amount.rao,
-            },
+        call = bt.calls.SubtensorModule.transfer_stake(
+            destination_coldkey=dest,
+            hotkey=source_stake,
+            origin_netuid=source_netuid,
+            destination_netuid=dest_netuid,
+            alpha_amount=amount,
         )
 
-        extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
-            call=call,
-            keypair=source_wallet.get_coldkey(wallet_password) if wallet_password else source_wallet.coldkey,
+        unsigned: UnsignedExtrinsic = self.subtensor.prepare_call(
+            call,
+            address=source_wallet.coldkeypub.ss58_address,
         )
 
-        return extrinsic
+        keypair = source_wallet.get_coldkey(wallet_password) if wallet_password else source_wallet.coldkey
+        signature = bytes(keypair.sign(unsigned.payload))
 
-    def decode_extrinsic(self, data: bytearray) -> GenericExtrinsic:
+        return SignedTransferPayload(
+            unsigned=unsigned,
+            signature=signature,
+            origin_coldkey=source_wallet.coldkeypub.ss58_address,
+            origin_hotkey=source_stake,
+            origin_netuid=source_netuid,
+            destination_coldkey=dest,
+            destination_netuid=dest_netuid,
+            alpha_amount=amount,
+        )
+
+    def decode_extrinsic(self, data: bytearray) -> SignedTransferPayload:
         """
-        Decode the extrinsic from a hex string.
+        Decode a SignedTransferPayload from its serialized bytearray form.
 
         Args:
-            data (bytearray): The encoded extrinsic to decode.
+            data (bytearray): The encoded payload to decode.
 
         Returns:
-            GenericExtrinsic: The decoded extrinsic.
+            SignedTransferPayload: The decoded payload.
         """
 
-        extrinsic = GenericExtrinsic(
-            data=ScaleBytes(data),
-            metadata=self.subtensor_api.substrate.metadata,
-            runtime_config=self.subtensor_api.substrate.runtime_config,
-        )
-        extrinsic.decode()
+        return SignedTransferPayload.from_dict(json.loads(bytes(data).decode()))
 
-        return extrinsic
-
-    def encode_extrinsic(self, extrinsic: GenericExtrinsic) -> bytearray:
+    def encode_extrinsic(self, payload: SignedTransferPayload) -> bytearray:
         """
-        Encode the extrinsic to a hex string.
+        Encode a SignedTransferPayload to a bytearray.
 
         Args:
-            extrinsic (GenericExtrinsic): The extrinsic to encode.
+            payload (SignedTransferPayload): The payload to encode.
 
         Returns:
-            bytesarray: The encoded extrinsic as a bytearray.
+            bytearray: The encoded payload.
         """
 
-        return extrinsic.data.data
+        return bytearray(json.dumps(payload.to_dict()).encode())
 
     def deposit(
         self,
-        extrinsic: GenericExtrinsic,
+        extrinsic: SignedTransferPayload,
         source_hotkey: str,
         vault_stake: str,
         vault_wallet: Wallet,
@@ -291,13 +333,13 @@ class CollateralManager:
         This function should be called on the owner validator side.
 
         Args:
-            extrinsic (GenericExtrinsic): The signed extrinsic for the stake transfer.
+            extrinsic (SignedTransferPayload): The signed payload for the stake transfer.
             source_hotkey (str): The source miner hotkey to deposit from.
             vault_stake (str): The stake's SS58 address of the vault to deposit the alpha tokens to.
             vault_wallet (Wallet): The wallet of the vault.
             owner_address (str): The owner address the EVM contract.
             owner_private_key (str): The private key of the owner.
-            wallet_password (Optional[str]): The password for the source wallet.
+            wallet_password (Optional[str]): The password for the vault wallet.
             max_backoff (float): The maximum backoff time in seconds for retries. Defaults to 30.0.
             max_retries (int): The maximum number of attempts to retry. Defaults to 3.
 
@@ -314,35 +356,11 @@ class CollateralManager:
 
         """
 
-        origin_coldkey = (
-            ss58_encode((extrinsic["address"].value))
-            if extrinsic["address"].value.startswith("0x") or extrinsic["address"].value.startswith("0X")
-            else extrinsic["address"].value
-        )
-
-        call = extrinsic["call"]
-        module_name = call["call_module"]["name"].value
-        function_name = call["call_function"]["name"].value
-
-        if not (module_name == "SubtensorModule" and function_name == "transfer_stake"):
-            raise ValueError(
-                f"Invalid extrinsic: expected 'SubtensorModule.transfer_stake', got '{module_name}.{function_name}'"
-            )
-
-        if isinstance(call_args := extrinsic["call"]["call_args"], dict):
-            destination_coldkey = call_args["destination_coldkey"].value
-            destination_netuid = call_args["destination_netuid"].value
-            origin_hotkey = call_args["hotkey"].value
-            origin_netuid = call_args["origin_netuid"].value
-        else:
-            try:
-                call_args = extrinsic.value["call"]["call_args"]  # pyright: ignore[reportOptionalSubscript]
-                destination_coldkey = next(arg for arg in call_args if arg["name"] == "destination_coldkey")["value"]
-                destination_netuid = next(arg for arg in call_args if arg["name"] == "destination_netuid")["value"]
-                origin_hotkey = next(arg for arg in call_args if arg["name"] == "hotkey")["value"]
-                origin_netuid = next(arg for arg in call_args if arg["name"] == "origin_netuid")["value"]
-            except StopIteration:
-                raise ValueError("Invalid extrinsic: missing required call arguments")
+        origin_coldkey = extrinsic.origin_coldkey
+        destination_coldkey = extrinsic.destination_coldkey
+        destination_netuid = extrinsic.destination_netuid
+        origin_hotkey = extrinsic.origin_hotkey
+        origin_netuid = extrinsic.origin_netuid
 
         if destination_coldkey != vault_wallet.coldkeypub.ss58_address:
             raise ValueError(
@@ -366,20 +384,19 @@ class CollateralManager:
 
         # 1. Transfer the stake to the vault wallet.
         try:
-            # Default RPC retries is 5 and RPC timeout is 60 seconds, which are configured in SubstrateInterface's __init__().
-            # No need to retry login here.
-            result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                extrinsic,
+            result: ExtrinsicResult = self.subtensor.submit_signature(
+                extrinsic.unsigned,
+                extrinsic.signature,
                 wait_for_inclusion=True,
             )
 
-            if result.is_success:
+            if result.success:
                 try:
-                    stake_added = self._get_stake_added_amount(result.triggered_events)
+                    stake_added = self._get_stake_added_amount(result.events)
                 except ValueError:
                     raise CriticalError("A stake has been transferred, but the amount is unknown")
             else:
-                raise ChainError.from_error(result.error_message)
+                raise result.error or ChainError("transfer_stake failed")
 
         except CriticalError:
             raise
@@ -388,36 +405,28 @@ class CollateralManager:
 
         # 2. Move the stake to the vault's stake address.
         if origin_hotkey != vault_stake:
+            if wallet_password:
+                vault_wallet.get_coldkey(wallet_password)
+
             try:
-                move_call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
-                    call_module="SubtensorModule",
-                    call_function="move_stake",
-                    call_params={
-                        "origin_hotkey": origin_hotkey,
-                        "origin_netuid": self.network.netuid,
-                        "destination_hotkey": vault_stake,
-                        "destination_netuid": self.network.netuid,
-                        "alpha_amount": stake_added.rao,
-                    },
+                move_result: ExtrinsicResult = self.subtensor.submit_call(
+                    bt.calls.SubtensorModule.move_stake(
+                        origin_hotkey=origin_hotkey,
+                        destination_hotkey=vault_stake,
+                        origin_netuid=self.network.netuid,
+                        destination_netuid=self.network.netuid,
+                        alpha_amount=stake_added.rao,
+                    ),
+                    vault_wallet,
                 )
 
-                move_extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
-                    call=move_call,
-                    keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
-                )
-
-                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                    move_extrinsic,
-                    wait_for_inclusion=True,
-                )
-
-                if result.is_success:
+                if move_result.success:
                     try:
-                        stake_added = self._get_stake_added_amount(result.triggered_events)
+                        stake_added = self._get_stake_added_amount(move_result.events)
                     except ValueError:
                         raise CriticalError("A stake has been transferred and moved, but the amount is unknown")
                 else:
-                    raise ChainError.from_error(result.error_message)
+                    raise move_result.error or ChainError("move_stake failed")
 
             except CriticalError:
                 raise
@@ -429,7 +438,7 @@ class CollateralManager:
                     # available rather than letting the revert itself fail outright over a small
                     # shortfall. A shortfall beyond the tolerance is treated as a real problem
                     # (e.g. concurrent activity on the shared vault coldkey), not silently eaten.
-                    current_stake = self.subtensor_api.staking.get_stake(
+                    current_stake: Balance = self.subtensor.staking.stake(
                         coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
                         hotkey_ss58=origin_hotkey,
                         netuid=self.network.netuid,
@@ -441,7 +450,7 @@ class CollateralManager:
                             f"{shortfall} rao short of the {stake_added.rao} rao expected "
                             f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
                         )
-                    revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                    revert_payload: SignedTransferPayload = self.create_stake_transfer_extrinsic(
                         amount=min(stake_added.rao, current_stake.rao),
                         source_stake=origin_hotkey,
                         source_wallet=vault_wallet,
@@ -449,13 +458,14 @@ class CollateralManager:
                         wallet_password=wallet_password,
                     )
 
-                    result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                        revert_extrinsic,
+                    revert_result: ExtrinsicResult = self.subtensor.submit_signature(
+                        revert_payload.unsigned,
+                        revert_payload.signature,
                         wait_for_inclusion=True,
                     )
 
-                    if not result.is_success:
-                        raise ChainError.from_error(result.error_message)
+                    if not revert_result.success:
+                        raise revert_result.error or ChainError("revert transfer_stake failed")
 
                 except CriticalError:
                     raise
@@ -511,7 +521,7 @@ class CollateralManager:
                 # Same rationale as the step 3 revert above: don't let a small shortfall
                 # (mainly the transfer_stake fee) block the whole revert, but treat a
                 # shortfall beyond tolerance as a real problem, not something to silently eat.
-                current_stake = self.subtensor_api.staking.get_stake(
+                current_stake = self.subtensor.staking.stake(
                     coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
                     hotkey_ss58=vault_stake,
                     netuid=self.network.netuid,
@@ -523,7 +533,7 @@ class CollateralManager:
                         f"{shortfall} rao short of the {stake_added.rao} rao expected "
                         f"(tolerance is {DEFAULT_REVERT_SHORTFALL_TOLERANCE_RAO} rao)"
                     )
-                revert_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+                revert_payload = self.create_stake_transfer_extrinsic(
                     amount=min(stake_added.rao, current_stake.rao),
                     source_stake=vault_stake,
                     source_wallet=vault_wallet,
@@ -531,13 +541,14 @@ class CollateralManager:
                     wallet_password=wallet_password,
                 )
 
-                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                    revert_extrinsic,
+                revert_result = self.subtensor.submit_signature(
+                    revert_payload.unsigned,
+                    revert_payload.signature,
                     wait_for_inclusion=True,
                 )
 
-                if not result.is_success:
-                    raise ChainError.from_error(result.error_message)
+                if not revert_result.success:
+                    raise revert_result.error or ChainError("revert transfer_stake failed")
 
             except CriticalError:
                 raise
@@ -796,13 +807,15 @@ class CollateralManager:
 
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
-        self._submit_extrinsic_with_retry(
-            create_extrinsic_fn=lambda: self.create_burn_alpha_extrinsic(
+        self._submit_call_with_retry(
+            create_call_fn=lambda: self.create_burn_alpha_extrinsic(
                 amount=amount.rao,
                 hotkey_ss58=vault_stake,
                 vault_wallet=vault_wallet,
                 wallet_password=wallet_password,
             ),
+            wallet=vault_wallet,
+            wallet_password=wallet_password,
             error_message="Failed to burn alpha tokens on Subtensor",
             max_backoff=max_backoff,
             max_retries=max_retries,
@@ -933,11 +946,6 @@ class CollateralManager:
         if not is_valid_ss58_address(vault_stake):
             raise ValueError(f"Invalid stake SS58 address: {vault_stake}")
 
-        # if self.subtensor_api.wallets.get_hotkey_owner(vault_stake) != vault_wallet.coldkeypub.ss58_address:
-        #     raise ValueError(
-        #         f"The stake {vault_stake} does not belong to the vault wallet {vault_wallet.coldkeypub.ss58_address}"
-        #     )
-
         amount: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
         if amount > (balance := Balance.from_rao(self.balance_of(source_hotkey), netuid=self.network.netuid)):
@@ -992,7 +1000,7 @@ class CollateralManager:
 
         # 2. Transfer the stake to the source coldkey.
         try:
-            transfer_extrinsic: GenericExtrinsic = self.create_stake_transfer_extrinsic(
+            transfer_payload: SignedTransferPayload = self.create_stake_transfer_extrinsic(
                 amount=amount.rao,
                 source_stake=vault_stake,
                 source_wallet=vault_wallet,
@@ -1000,13 +1008,14 @@ class CollateralManager:
                 wallet_password=wallet_password,
             )
 
-            result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                transfer_extrinsic,
+            transfer_result: ExtrinsicResult = self.subtensor.submit_signature(
+                transfer_payload.unsigned,
+                transfer_payload.signature,
                 wait_for_inclusion=True,
             )
 
-            if not result.is_success:
-                raise ChainError.from_error(result.error_message)
+            if not transfer_result.success:
+                raise transfer_result.error or ChainError("transfer_stake failed")
 
         except Exception as e:
             # 3. Revert the withdrawal if the stake transfer fails.
@@ -1033,13 +1042,13 @@ class CollateralManager:
         hotkey_ss58: str,
         vault_wallet: Wallet,
         wallet_password: Optional[str] = None,
-    ) -> GenericExtrinsic:
+    ) -> Any:
         """
-        Create a burn_alpha extrinsic to permanently burn alpha stake on Subtensor.
+        Create a burn_alpha call to permanently burn alpha stake on Subtensor.
 
         NOTE:
-        - This function ONLY creates and signs the extrinsic.
-        - The caller is responsible for submitting it via submit_extrinsic().
+        - This function validates the stake balance and returns the composed call.
+        - The caller is responsible for submitting it via submit_call() or _submit_call_with_retry().
 
         Args:
             amount (int): The amount of alpha tokens to burn in Rao unit.
@@ -1048,7 +1057,7 @@ class CollateralManager:
             wallet_password (Optional[str]): Password if the wallet is encrypted
 
         Returns:
-            GenericExtrinsic: Signed burn_alpha extrinsic
+            bt.calls.Call: Composed burn_alpha call ready for submission
         """
 
         if amount <= 0:
@@ -1059,7 +1068,7 @@ class CollateralManager:
 
         amount_balance: Balance = Balance.from_rao(amount, netuid=self.network.netuid)
 
-        staked_amount: Balance = self.subtensor_api.staking.get_stake(
+        staked_amount: Balance = self.subtensor.staking.stake(
             coldkey_ss58=vault_wallet.coldkeypub.ss58_address,
             hotkey_ss58=hotkey_ss58,
             netuid=self.network.netuid,
@@ -1068,55 +1077,48 @@ class CollateralManager:
         if amount_balance > staked_amount:
             raise ValueError(f"Insufficient stake: {staked_amount}, requested: {amount_balance}")
 
-        call: GenericCall = self.subtensor_api.inner_subtensor.substrate.compose_call(
-            call_module="SubtensorModule",
-            call_function="burn_alpha",
-            call_params={
-                "netuid": self.network.netuid,
-                "hotkey": hotkey_ss58,
-                "amount": amount,
-            },
+        return bt.calls.SubtensorModule.burn_alpha(
+            hotkey=hotkey_ss58,
+            amount=amount,
+            netuid=self.network.netuid,
         )
 
-        extrinsic: GenericExtrinsic = self.subtensor_api.inner_subtensor.substrate.create_signed_extrinsic(
-            call=call,
-            keypair=vault_wallet.get_coldkey(wallet_password) if wallet_password else vault_wallet.coldkey,
-        )
-
-        return extrinsic
-
-    def _submit_extrinsic_with_retry(
+    def _submit_call_with_retry(
         self,
-        create_extrinsic_fn: Callable[[], GenericExtrinsic],
+        create_call_fn: Callable[[], Any],
+        wallet: Wallet,
         error_message: str,
+        wallet_password: Optional[str] = None,
         max_backoff: float = 30.0,
         max_retries: int = 3,
-    ) -> ExtrinsicReceipt | None:
+    ) -> ExtrinsicResult:
         """
-        Submit an extrinsic with retry logic using exponential backoff.
+        Submit a call with retry logic using exponential backoff.
 
         Args:
-            create_extrinsic_fn: A callable that creates and returns a GenericExtrinsic.
+            create_call_fn: A callable that creates and returns a bt.calls.Call.
+            wallet: The wallet to sign the call with.
             error_message: Error message to use when all retries are exhausted.
+            wallet_password: Optional password to unlock the wallet.
             max_backoff: Maximum backoff time in seconds. Defaults to 30.0.
             max_retries: Maximum number of retry attempts. Defaults to 3.
 
         Returns:
-            ExtrinsicReceipt: The result of the successful extrinsic submission.
+            ExtrinsicResult: The result of the successful call submission.
 
         Raises:
             SubtensorError: If all retry attempts fail.
         """
+        if wallet_password:
+            wallet.get_coldkey(wallet_password)
+
         for i in range(max_retries):
             try:
-                extrinsic: GenericExtrinsic = create_extrinsic_fn()
-                result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
-                    extrinsic,
-                    wait_for_inclusion=True,
-                )
+                call = create_call_fn()
+                result: ExtrinsicResult = self.subtensor.submit_call(call, wallet)
 
-                if not result.is_success:
-                    raise ChainError.from_error(result.error_message)
+                if not result.success:
+                    raise result.error or ChainError("Call failed")
 
                 return result
 
