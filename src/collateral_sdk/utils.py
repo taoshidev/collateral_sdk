@@ -1,4 +1,5 @@
-from bittensor.utils import is_valid_ss58_address, ss58_address_to_bytes
+from bittensor.sp_core import ss58_decode
+from bittensor.wallets import is_valid_ss58_address
 from eth_typing import ChecksumAddress
 from web3 import Web3
 
@@ -21,8 +22,8 @@ def ss58_to_h160(address: str) -> ChecksumAddress:
     if not is_valid_ss58_address(address):
         raise ValueError(f"Invalid SS58 address: {address}")
 
-    account_id_bytes = ss58_address_to_bytes(address)
-    account_id_hex = account_id_bytes.hex()
+    # ss58_decode returns a hex string (no 0x prefix) of the 32-byte AccountId
+    account_id_hex = ss58_decode(address)
 
     # Take the first 20 bytes (40 hex characters) of the AccountId32.
     # Refer to https://github.com/gztensor/precompile-examples/blob/3680e830f1a1e90a2328410fd86255b6b184d4b7/src/util/eth-helpers.js#L55
