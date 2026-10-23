@@ -583,36 +583,14 @@ class CollateralManager:
         if not is_valid_ss58_address(address):
             raise ValueError(f"Invalid SS58 address: {address}")
 
-        for i in range(max_retries):
-            try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-                tx = contract.functions.deposit(ss58_to_h160(address), amount).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
-
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
-
-            except Exception as e:
-                if i < max_retries - 1:
-                    time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"Failed to force deposit into the EVM contract: {e}") from e
+        self._execute_evm_contract_function(
+            build_tx_fn=lambda contract: contract.functions.deposit(ss58_to_h160(address), amount),
+            owner_address=owner_address,
+            owner_private_key=owner_private_key,
+            error_message="Failed to force deposit into the EVM contract",
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+        )
 
     def force_withdraw(
         self,
@@ -647,36 +625,14 @@ class CollateralManager:
         if not is_valid_ss58_address(address):
             raise ValueError(f"Invalid SS58 address: {address}")
 
-        for i in range(max_retries):
-            try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
-                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-                tx = contract.functions.withdraw(ss58_to_h160(address), amount).build_transaction(
-                    {
-                        "chainId": self.network.evm_chain_id,
-                        "from": owner_address,
-                        "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-                    }
-                )
-
-                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    break
-                else:
-                    raise RuntimeError(
-                        f"Transaction failed: {tx_hash.hex()}" if tx_hash in dir() else "Transaction failed"
-                    )
-
-            except Exception as e:
-                if i < max_retries - 1:
-                    time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"Failed to force withdraw from the EVM contract: {e}") from e
+        self._execute_evm_contract_function(
+            build_tx_fn=lambda contract: contract.functions.withdraw(ss58_to_h160(address), amount),
+            owner_address=owner_address,
+            owner_private_key=owner_private_key,
+            error_message="Failed to force withdraw from the EVM contract",
+            max_backoff=max_backoff,
+            max_retries=max_retries,
+        )
 
     def get_slashed_collateral(self) -> int:
         """
@@ -1107,9 +1063,16 @@ class CollateralManager:
         Raises:
             SubtensorError: If all retry attempts fail.
         """
+        # Create (and sign) the extrinsic once and resubmit that same extrinsic on every
+        # retry. Its fixed signing nonce means at most one can ever be included, so a
+        # transient RPC failure after submission can't apply it twice -- earlier code
+        # signed a fresh extrinsic per retry. It is only re-created if creation itself
+        # failed, in which case nothing was submitted.
+        extrinsic: Optional[GenericExtrinsic] = None
         for i in range(max_retries):
             try:
-                extrinsic: GenericExtrinsic = create_extrinsic_fn()
+                if extrinsic is None:
+                    extrinsic = create_extrinsic_fn()
                 result: ExtrinsicReceipt = self.subtensor_api.inner_subtensor.substrate.submit_extrinsic(
                     extrinsic,
                     wait_for_inclusion=True,
@@ -1154,6 +1117,11 @@ class CollateralManager:
         Raises:
             EVMError: If all retry attempts fail.
         """
+        # 1. Build and sign the transaction. Nothing has been broadcast yet, so a
+        # failure here (e.g. rate limiting while fetching the nonce or estimating gas)
+        # is safe to retry from scratch.
+        signed_tx = None
+        last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
                 web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
@@ -1170,17 +1138,45 @@ class CollateralManager:
                 )
 
                 signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-                tx_hash = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-
-                if receipt["status"] == 1:
-                    return tx_hash.hex()
-                else:
-                    raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
-
+                break
             except Exception as e:
+                last_error = e
                 if i < max_retries - 1:
                     time.sleep(min(2**i, max_backoff))
-                    continue
-                else:
-                    raise EVMError(f"{error_message}: {e}") from e
+
+        if signed_tx is None:
+            raise EVMError(f"{error_message}: {last_error}") from last_error
+
+        # 2. Broadcast and confirm. Every retry rebroadcasts the identical signed
+        # transaction, so the chain's nonce uniqueness guarantees at most one can ever
+        # be mined for this call -- earlier code built a brand-new transaction on every
+        # retry, so a transient RPC failure after the broadcast (e.g. a 429 while polling
+        # for the receipt) could mine more than one real slash.
+        tx_hash = signed_tx.hash
+        receipt = None
+        for i in range(max_retries):
+            try:
+                web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+                break
+            except Exception as e:
+                last_error = e
+                if i < max_retries - 1:
+                    time.sleep(min(2**i, max_backoff))
+
+        if receipt is None:
+            # Polling for the receipt never succeeded -- before concluding the
+            # transaction failed, check once more directly, since it may have
+            # actually been mined despite RPC errors during confirmation.
+            try:
+                receipt = web3.eth.get_transaction_receipt(tx_hash)
+            except Exception:
+                receipt = None
+
+        if receipt is None:
+            raise EVMError(f"{error_message}: {last_error}") from last_error
+
+        if receipt["status"] != 1:
+            raise RuntimeError(f"Transaction failed: {tx_hash.hex()}")
+
+        return tx_hash.hex()
