@@ -99,20 +99,42 @@ class CollateralManager:
         network (Network): The network to use for collateral operations. Defaults to Network.TESTNET.
         program_address (Optional[str]): The address of the EVM contract for collateral operations.
                                          Defaults to the already-deployed and trusted program address.
+        evm_endpoint (Optional[str]): The EVM JSON-RPC endpoint, e.g. "http://127.0.0.1:9944" for a
+                                      self-hosted subtensor node. Defaults to the network's public endpoint.
+        subtensor_endpoint (Optional[str]): The subtensor endpoint or network name, e.g.
+                                            "ws://127.0.0.1:9944". Defaults to the network's public endpoint.
     """
 
     def __init__(
         self,
         network: Network = Network.TESTNET,
         program_address: Optional[str] = None,
+        evm_endpoint: Optional[str] = None,
+        subtensor_endpoint: Optional[str] = None,
     ):
         with open(Path(abi.__path__[0]) / "Collateral.abi.json", "r") as f:
             self.abi: Any = json.load(f)
 
+        self.evm_endpoint = evm_endpoint or network.evm_endpoint
+        self.subtensor_endpoint = subtensor_endpoint or network.subtensor_network
+
+        # A custom endpoint must serve the same chain: a node for another chain would
+        # reject signed transactions and, worse, return that chain's balances on reads.
+        if evm_endpoint is not None:
+            try:
+                chain_id = Web3(Web3.HTTPProvider(self.evm_endpoint)).eth.chain_id
+            except Exception as e:
+                raise ValueError(f"Could not reach EVM endpoint {self.evm_endpoint}: {e}") from e
+            if chain_id != network.evm_chain_id:
+                raise ValueError(
+                    f"EVM endpoint {self.evm_endpoint} serves chain id {chain_id}, "
+                    f"expected {network.evm_chain_id} for {network.name}"
+                )
+
         if program_address is not None:
             try:
                 program_address = Web3.to_checksum_address(program_address)
-                web3 = Web3(Web3.HTTPProvider(network.evm_endpoint))
+                web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
                 contract = web3.eth.contract(program_address, abi=self.abi)
                 contract.functions.getTotalCollateral().call()
             except Exception:
@@ -125,7 +147,7 @@ class CollateralManager:
     @property
     def subtensor_api(self):
         if self._subtensor_api is None:
-            self._subtensor_api = SubtensorApi(network=self.network.subtensor_network)
+            self._subtensor_api = SubtensorApi(network=self.subtensor_endpoint)
         return self._subtensor_api
 
     def _get_stake_added_amount(self, events: list[dict]) -> Balance:
@@ -164,7 +186,7 @@ class CollateralManager:
         if not is_valid_ss58_address(address):
             raise ValueError(f"Invalid SS58 address: {address}")
 
-        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
         contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
         balance = contract.functions.balanceOf(ss58_to_h160(address)).call()
@@ -471,7 +493,7 @@ class CollateralManager:
         # transaction -- the chain's nonce uniqueness then guarantees at most one
         # deposit can ever be mined for this call, no matter how many times a
         # transient RPC failure forces us to retry.
-        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
         contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
         tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
@@ -642,7 +664,7 @@ class CollateralManager:
             int: The total amount of slashed collateral in Rao unit.
         """
 
-        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
         contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
         balance = contract.functions.getSlashedCollateral().call()
@@ -656,7 +678,7 @@ class CollateralManager:
             int: The total amount of collateral in Rao unit.
         """
 
-        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
         contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
         balance = contract.functions.getTotalCollateral().call()
@@ -906,7 +928,7 @@ class CollateralManager:
         # transient RPC failure (e.g. rate limiting while polling for the receipt)
         # forces us to retry -- earlier code built a brand-new transaction on every
         # retry, which could submit and mine more than one real withdrawal.
-        web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
         contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
         tx = contract.functions.withdraw(ss58_to_h160(source_hotkey), amount.rao).build_transaction(
@@ -1124,7 +1146,7 @@ class CollateralManager:
         last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
-                web3 = Web3(Web3.HTTPProvider(self.network.evm_endpoint))
+                web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
                 contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
 
                 nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]

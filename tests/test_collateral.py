@@ -124,3 +124,48 @@ def test_extrinsic_retry_exhaustion_raises(_sleep):
 
     with pytest.raises(SubtensorError, match="Failed to burn"):
         manager._submit_extrinsic_with_retry(create_extrinsic_fn=MagicMock(), error_message="Failed to burn")
+
+
+@patch("collateral_sdk.collateral.SubtensorApi")
+@patch("collateral_sdk.collateral.Web3")
+def test_default_endpoints_are_the_networks(web3_cls, subtensor_api_cls):
+    manager = CollateralManager(Network.MAINNET)
+
+    assert manager.evm_endpoint == "https://lite.chain.opentensor.ai"
+    assert manager.subtensor_endpoint == "finney"
+    web3_cls.assert_not_called()
+    manager.subtensor_api
+    subtensor_api_cls.assert_called_once_with(network="finney")
+
+
+@patch("collateral_sdk.collateral.SubtensorApi")
+@patch("collateral_sdk.collateral.Web3")
+def test_custom_endpoints_are_used(web3_cls, subtensor_api_cls):
+    web3_cls.return_value.eth.chain_id = Network.MAINNET.evm_chain_id
+    manager = CollateralManager(
+        Network.MAINNET, evm_endpoint="http://127.0.0.1:9944", subtensor_endpoint="ws://127.0.0.1:9944"
+    )
+
+    web3_cls.HTTPProvider.assert_called_with("http://127.0.0.1:9944")
+    assert manager.program_address == Network.MAINNET.evm_program_address
+    assert manager.network.netuid == 8
+    manager.balance_of("5C4hrfjw9DjXZTzV3MwzrrAr9P1MJhSrvWGWqi1eSuyUpnhM")
+    assert web3_cls.HTTPProvider.call_args_list[-1].args == ("http://127.0.0.1:9944",)
+    manager.subtensor_api
+    subtensor_api_cls.assert_called_once_with(network="ws://127.0.0.1:9944")
+
+
+@patch("collateral_sdk.collateral.Web3")
+def test_custom_evm_endpoint_on_wrong_chain_raises(web3_cls):
+    web3_cls.return_value.eth.chain_id = Network.TESTNET.evm_chain_id
+
+    with pytest.raises(ValueError, match="serves chain id 945, expected 964"):
+        CollateralManager(Network.MAINNET, evm_endpoint="http://127.0.0.1:9944")
+
+
+@patch("collateral_sdk.collateral.Web3")
+def test_unreachable_custom_evm_endpoint_raises(web3_cls):
+    type(web3_cls.return_value.eth).chain_id = property(MagicMock(side_effect=ConnectionError("refused")))
+
+    with pytest.raises(ValueError, match="Could not reach EVM endpoint"):
+        CollateralManager(Network.MAINNET, evm_endpoint="http://127.0.0.1:9944")
