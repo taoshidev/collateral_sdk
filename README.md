@@ -48,3 +48,20 @@ Add the following to `requirements.txt`.
 ```
 git+https://github.com/taoshidev/collateral_sdk.git@<VERSION>#egg=collateral_sdk
 ```
+
+## Using a self-hosted subtensor node
+
+By default `CollateralManager` uses the public endpoints, which are rate limited. To route all
+EVM and subtensor traffic through your own node, pass both endpoints:
+
+```python
+manager = CollateralManager(
+    Network.MAINNET,
+    evm_endpoint="http://127.0.0.1:9944",
+    subtensor_endpoint="ws://127.0.0.1:9944",
+)
+```
+
+The chain id, contract address, and netuid still come from `network`. The constructor checks that
+`evm_endpoint` serves the network's chain id and raises `ValueError` if it does not, or if it cannot
+be reached.
