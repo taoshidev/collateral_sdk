@@ -489,43 +489,58 @@ class CollateralManager:
                 raise SubtensorError(f"Failed to move the stake to the vault's stake address: {e}") from e
 
         # 4. Deposit the collateral into the EVM contract.
-        # Sign once with a fixed nonce so every retry rebroadcasts the identical
-        # transaction -- the chain's nonce uniqueness then guarantees at most one
-        # deposit can ever be mined for this call, no matter how many times a
-        # transient RPC failure forces us to retry.
-        web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
-        contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
-
-        tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
-            {
-                "chainId": self.network.evm_chain_id,
-                "from": owner_address,
-                "nonce": web3.eth.get_transaction_count(owner_address, block_identifier="pending"),  # pyright: ignore[reportArgumentType]
-            }
-        )
-        signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
-        tx_hash = signed_tx.hash
-
-        receipt = None
+        # By now the stake sits in the vault, so every failure from here on must end
+        # in a credit or a revert. An exception that escapes without either strands
+        # the stake: it is in the vault and nobody is credited for it.
+        #
+        # 4a. Build and sign. Nothing has been broadcast yet, so a failure here (for
+        # example a 429 from the EVM RPC while fetching the nonce) is safe to retry,
+        # and if it never succeeds, safe to revert.
+        signed_tx = None
+        nonce = None
+        web3 = None
         last_error: Optional[Exception] = None
         for i in range(max_retries):
             try:
-                web3.eth.send_raw_transaction(signed_tx.raw_transaction)
-                receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+                web3 = Web3(Web3.HTTPProvider(self.evm_endpoint))
+                contract = web3.eth.contract(self.program_address, abi=self.abi)  # pyright: ignore[reportArgumentType, reportCallIssue]
+                nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]
+                tx = contract.functions.deposit(ss58_to_h160(source_hotkey), stake_added.rao).build_transaction(
+                    {
+                        "chainId": self.network.evm_chain_id,
+                        "from": owner_address,
+                        "nonce": nonce,
+                    }
+                )
+                # Sign once with a fixed nonce so every retry rebroadcasts the identical
+                # transaction -- the chain's nonce uniqueness then guarantees at most one
+                # deposit can ever be mined for this call.
+                signed_tx = web3.eth.account.sign_transaction(tx, private_key=owner_private_key)
                 break
             except Exception as e:
                 last_error = e
                 if i < max_retries - 1:
                     time.sleep(min(2**i, max_backoff))
 
-        if receipt is None:
-            # Polling for the receipt never succeeded -- before concluding the
-            # deposit failed, check once more directly, since the transaction
-            # may have actually been mined despite RPC errors during confirmation.
-            try:
-                receipt = web3.eth.get_transaction_receipt(tx_hash)
-            except Exception:
-                receipt = None
+        # 4b. Broadcast and confirm.
+        receipt = None
+        if signed_tx is not None and web3 is not None:
+            tx_hash = signed_tx.hash
+            for i in range(max_retries):
+                try:
+                    web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
+                    break
+                except Exception as e:
+                    last_error = e
+                    if i < max_retries - 1:
+                        time.sleep(min(2**i, max_backoff))
+
+            if receipt is None:
+                # Polling never succeeded. The transaction may have been mined anyway,
+                # and reverting the stake after a mined deposit would pay the miner twice
+                # (stake back AND collateral credited), so look harder before reverting.
+                receipt = self._confirm_deposit_receipt(web3, tx_hash, owner_address, nonce, max_retries, max_backoff)
 
         if receipt is None or receipt["status"] != 1:
             # 4. Revert the stake transfer if deposit in the EVM fails.
@@ -571,6 +586,61 @@ class CollateralManager:
             raise EVMError(f"Failed to deposit into the EVM contract: {last_error}") from last_error
 
         return stake_added
+
+    def _confirm_deposit_receipt(
+        self,
+        web3: Web3,
+        tx_hash: Any,
+        owner_address: str,
+        nonce: Optional[int],
+        max_retries: int,
+        max_backoff: float,
+    ) -> Optional[dict]:
+        """
+        Find the receipt of a broadcast deposit whose confirmation failed.
+
+        Returns the receipt if it can be read, or None if the transaction was not mined, so
+        the caller reverts the stake transfer. Raises CriticalError when the outcome cannot
+        be determined, or when the owner's nonce shows the transaction was mined but its
+        receipt cannot be read: reverting then could pay the miner twice, so the stake is
+        left in the vault and the operator reconciles it from the transaction hash.
+        """
+        for i in range(max_retries):
+            try:
+                return web3.eth.get_transaction_receipt(tx_hash)
+            except Exception:
+                if i < max_retries - 1:
+                    time.sleep(min(2**i, max_backoff))
+
+        hash_hex = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+        if nonce is None:
+            raise CriticalError(f"Deposit transaction {hash_hex} outcome unknown (no nonce); not reverting")
+        try:
+            mined_nonce = web3.eth.get_transaction_count(owner_address, block_identifier="latest")  # pyright: ignore[reportArgumentType]
+        except Exception as e:
+            raise CriticalError(
+                f"Deposit transaction {hash_hex} outcome unknown: receipt and owner nonce unreadable ({e}); "
+                "not reverting the stake transfer"
+            ) from e
+        if mined_nonce > nonce:
+            raise CriticalError(
+                f"Deposit transaction {hash_hex} was mined (owner nonce {mined_nonce} > {nonce}) but its receipt "
+                "could not be read; not reverting the stake transfer"
+            )
+        try:
+            pending_nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]
+        except Exception as e:
+            raise CriticalError(
+                f"Deposit transaction {hash_hex} outcome unknown: pending nonce unreadable ({e}); "
+                "not reverting the stake transfer"
+            ) from e
+        if pending_nonce > nonce:
+            # Still in the mempool: it can be mined after a revert, which would pay twice.
+            raise CriticalError(
+                f"Deposit transaction {hash_hex} is still pending (pending nonce {pending_nonce} > {nonce}); "
+                "not reverting the stake transfer"
+            )
+        return None
 
     def force_deposit(
         self,
