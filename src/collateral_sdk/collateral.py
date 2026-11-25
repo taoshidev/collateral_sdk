@@ -410,6 +410,7 @@ class CollateralManager:
                 extrinsic.unsigned,
                 extrinsic.signature,
                 wait_for_inclusion=True,
+                wait_for_finalization=False,
             )
 
             if result.success:
@@ -440,6 +441,8 @@ class CollateralManager:
                         alpha_amount=stake_added.rao,
                     ),
                     vault_wallet,
+                    wait_for_inclusion=True,
+                    wait_for_finalization=False,
                 )
 
                 if move_result.success:
@@ -484,6 +487,7 @@ class CollateralManager:
                         revert_payload.unsigned,
                         revert_payload.signature,
                         wait_for_inclusion=True,
+                        wait_for_finalization=False,
                     )
 
                     if not revert_result.success:
@@ -567,6 +571,7 @@ class CollateralManager:
                     revert_payload.unsigned,
                     revert_payload.signature,
                     wait_for_inclusion=True,
+                    wait_for_finalization=False,
                 )
 
                 if not revert_result.success:
@@ -990,6 +995,7 @@ class CollateralManager:
                 transfer_payload.unsigned,
                 transfer_payload.signature,
                 wait_for_inclusion=True,
+                wait_for_finalization=False,
             )
 
             if not transfer_result.success:
@@ -1102,6 +1108,7 @@ class CollateralManager:
                     unsigned,
                     signature,
                     wait_for_inclusion=True,
+                    wait_for_finalization=False,
                 )
 
                 if not result.success:
