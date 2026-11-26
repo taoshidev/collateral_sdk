@@ -16,6 +16,7 @@ from scalecodec.utils.ss58 import ss58_encode
 from scalecodec.types import GenericCall, GenericExtrinsic
 from scalecodec import ScaleBytes
 from web3 import Web3
+from web3.exceptions import TransactionNotFound
 
 from . import abi
 from .errors import CriticalError, EVMError, SubtensorError
@@ -599,11 +600,12 @@ class CollateralManager:
         """
         Find the receipt of a broadcast deposit whose confirmation failed.
 
-        Returns the receipt if it can be read, or None if the transaction was not mined, so
-        the caller reverts the stake transfer. Raises CriticalError when the outcome cannot
-        be determined, or when the owner's nonce shows the transaction was mined but its
-        receipt cannot be read: reverting then could pay the miner twice, so the stake is
-        left in the vault and the operator reconciles it from the transaction hash.
+        Returns the receipt if it can be read, or None if the transaction can never be mined
+        (dropped with its nonce unused, or its nonce taken by another owner transaction), so the
+        caller reverts the stake transfer. Raises CriticalError when the outcome cannot be
+        determined, or when the transaction exists but its receipt cannot be read: reverting
+        then could pay the miner twice, so the stake is left in the vault and the operator
+        reconciles it from the transaction hash.
         """
         for i in range(max_retries):
             try:
@@ -623,10 +625,29 @@ class CollateralManager:
                 "not reverting the stake transfer"
             ) from e
         if mined_nonce > nonce:
-            raise CriticalError(
-                f"Deposit transaction {hash_hex} was mined (owner nonce {mined_nonce} > {nonce}) but its receipt "
-                "could not be read; not reverting the stake transfer"
-            )
+            # The nonce is used, but not necessarily by this transaction: another owner transaction
+            # (a concurrent deposit, withdrawal or slash) may have fetched the same pending nonce and
+            # won it. Then this deposit can never be mined and the stake must be reverted. Only a
+            # lookup that answers "not found" on every attempt proves that; anything else (found, or
+            # an RPC error such as a 429) leaves the outcome open, so the stake stays in the vault.
+            for i in range(max_retries):
+                try:
+                    web3.eth.get_transaction(tx_hash)
+                except TransactionNotFound:
+                    if i < max_retries - 1:
+                        time.sleep(min(2**i, max_backoff))
+                    continue
+                except Exception as e:
+                    raise CriticalError(
+                        f"Deposit transaction {hash_hex} outcome unknown: owner nonce {mined_nonce} > {nonce} but "
+                        f"the transaction lookup failed ({e}); not reverting the stake transfer"
+                    ) from e
+                raise CriticalError(
+                    f"Deposit transaction {hash_hex} was mined (owner nonce {mined_nonce} > {nonce}) but its receipt "
+                    "could not be read; not reverting the stake transfer"
+                )
+            # Not found on any attempt: another transaction took the nonce, so revert.
+            return None
         try:
             pending_nonce = web3.eth.get_transaction_count(owner_address, block_identifier="pending")  # pyright: ignore[reportArgumentType]
         except Exception as e:

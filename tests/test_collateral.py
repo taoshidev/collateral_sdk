@@ -277,6 +277,7 @@ def test_deposit_mined_but_receipt_unreadable_does_not_revert(_sleep):
     web3.eth.wait_for_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
     web3.eth.get_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
     web3.eth.get_transaction_count.side_effect = [7, 8]  # pending at sign, then latest: nonce 7 consumed
+    web3.eth.get_transaction.return_value = {"hash": "0xdeposit", "blockNumber": 100}  # ours took the nonce
 
     with patch("collateral_sdk.collateral.Web3", web3_cls):
         with pytest.raises(CriticalError, match="was mined"):
@@ -317,3 +318,65 @@ def test_deposit_not_mined_and_dropped_reverts(_sleep):
             _deposit(manager)
 
     assert submit.call_count == 2  # stake transfer + revert
+
+
+@patch("collateral_sdk.collateral.ss58_to_h160", lambda x: "0xminer")
+@patch("collateral_sdk.collateral.time.sleep")
+def test_deposit_nonce_taken_by_another_owner_tx_reverts(_sleep):
+    # A concurrent owner transaction fetched the same pending nonce and was mined first:
+    # this deposit can never be mined, so the stake must go back to the miner.
+    from web3.exceptions import TransactionNotFound
+
+    manager, submit = _deposit_manager()
+    web3_cls, web3, _ = _mock_web3()
+    web3.eth.send_raw_transaction.side_effect = ValueError("nonce too low")
+    web3.eth.get_transaction_receipt.side_effect = TransactionNotFound("not found")
+    web3.eth.get_transaction_count.side_effect = [7, 8]  # sign; latest: nonce 7 used by the other tx
+    web3.eth.get_transaction.side_effect = TransactionNotFound("not found")
+
+    with patch("collateral_sdk.collateral.Web3", web3_cls):
+        with pytest.raises(EVMError, match="Failed to deposit into the EVM contract"):
+            _deposit(manager)
+
+    assert web3.eth.get_transaction.call_count == 3  # not found on every attempt
+    assert submit.call_count == 2  # stake transfer + revert
+
+
+@patch("collateral_sdk.collateral.ss58_to_h160", lambda x: "0xminer")
+@patch("collateral_sdk.collateral.time.sleep")
+def test_deposit_nonce_used_and_lookup_fails_does_not_revert(_sleep):
+    from collateral_sdk.errors import CriticalError
+
+    manager, submit = _deposit_manager()
+    web3_cls, web3, _ = _mock_web3()
+    web3.eth.wait_for_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
+    web3.eth.get_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
+    web3.eth.get_transaction_count.side_effect = [7, 8]
+    web3.eth.get_transaction.side_effect = RuntimeError("429 Client Error: Too Many Requests")
+
+    with patch("collateral_sdk.collateral.Web3", web3_cls):
+        with pytest.raises(CriticalError, match="outcome unknown"):
+            _deposit(manager)
+
+    assert submit.call_count == 1  # a 429 proves nothing, so no revert
+
+
+@patch("collateral_sdk.collateral.ss58_to_h160", lambda x: "0xminer")
+@patch("collateral_sdk.collateral.time.sleep")
+def test_deposit_nonce_used_and_found_on_later_lookup_does_not_revert(_sleep):
+    # A lagging node answering "not found" once must not trigger a revert if a later lookup finds it.
+    from web3.exceptions import TransactionNotFound
+    from collateral_sdk.errors import CriticalError
+
+    manager, submit = _deposit_manager()
+    web3_cls, web3, _ = _mock_web3()
+    web3.eth.wait_for_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
+    web3.eth.get_transaction_receipt.side_effect = RuntimeError("429 Client Error: Too Many Requests")
+    web3.eth.get_transaction_count.side_effect = [7, 8]
+    web3.eth.get_transaction.side_effect = [TransactionNotFound("not found"), {"hash": "0xdeposit", "blockNumber": 100}]
+
+    with patch("collateral_sdk.collateral.Web3", web3_cls):
+        with pytest.raises(CriticalError, match="was mined"):
+            _deposit(manager)
+
+    assert submit.call_count == 1
